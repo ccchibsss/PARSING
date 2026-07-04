@@ -1,209 +1,470 @@
-import requests
-import time
-import os
-import pandas as pd
-import sqlite3
+import asyncio
 import streamlit as st
-from bs4 import BeautifulSoup
-import logging
+import pandas as pd
+from io import BytesIO
 import random
-import threading
+import time
+import json
+from datetime import datetime
 
-def main():
-    # Логирование
-    logging.basicConfig(filename='wildberries_parser.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --- УСТАНОВКА ЗАВИСИМОСТЕЙ ---
+# pip install streamlit pandas openpyxl ozonapi-async yandex-market-api wildberries-api aiohttp
 
-    # Конфигурация
-    MAX_RETRIES = 10
-    BACKOFF_BASE = 2
-    DELAY_BETWEEN_REQUESTS = 1
-    USE_PROXIES = False
-    PROXY_LIST = []
+from ozonapi import SellerAPI, SellerAPIConfig
+from yandex_market_api import YandexMarketClient
+from wb_api.async_api import AsyncAPI as WildberriesAPI
+import aiohttp
 
-    # Инициализация Streamlit
-    st.set_page_config(page_title="Расширенный парсер Wildberries", layout="wide")
-    if 'progress' not in st.session_state:
-        st.session_state['progress'] = 0
-    if 'stop' not in st.session_state:
-        st.session_state['stop'] = False
-    if 'pause' not in st.session_state:
-        st.session_state['pause'] = False
+# ============================================
+# 1. КОНФИГУРАЦИЯ (secrets.toml)
+# ============================================
+# secrets.toml:
+# OZON_CLIENT_ID = "ваш_id"
+# OZON_API_KEY = "ваш_ключ"
+# YANDEX_API_KEY = "ваш_токен"
+# WILDBERRIES_TOKEN = "ваш_токен"
 
-    st.title("Расширенный парсер Wildberries")
-    st.write("Настройте параметры и запускайте парсинг.")
-
-    save_format = st.sidebar.radio("Формат сохранения", ["CSV", "SQLite"])
-    filename_csv = st.sidebar.text_input("Имя файла CSV", value='wildberries_products_extended.csv')
-    if save_format == "SQLite":
-        db_name = st.sidebar.text_input("Имя базы данных SQLite", value="wildberries_extended.db")
-        conn = sqlite3.connect(db_name)
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS products (
-                link TEXT PRIMARY KEY,
-                title TEXT,
-                price TEXT,
-                images TEXT,
-                description TEXT,
-                characteristics TEXT
+# ============================================
+# 2. ФУНКЦИЯ ДЛЯ OZON (все характеристики)
+# ============================================
+async def get_ozon_full_info(article_list):
+    """
+    Получает ВСЕ характеристики товаров через Ozon API v4
+    Метод: POST /v4/product/info/attributes
+    """
+    results = {}
+    try:
+        config = SellerAPIConfig(
+            client_id=st.secrets["OZON_CLIENT_ID"],
+            api_key=st.secrets["OZON_API_KEY"],
+            max_requests_per_second=25,
+            max_retries=5,
+            retry_min_wait=2.0,
+            retry_max_wait=10.0,
+            request_timeout=30.0
+        )
+        async with SellerAPI(config=config) as api:
+            # Получаем ВСЕ атрибуты товаров
+            products = await api.product_info_attributes(
+                product_ids=article_list,
+                # Специфические параметры для Ozon API
+                # Можно добавить language="RU"
             )
-        ''')
-        conn.commit()
+            
+            for product in products:
+                # Базовая информация
+                result = {
+                    "sku": getattr(product, "sku", None),
+                    "offer_id": getattr(product, "offer_id", None),
+                    "name": getattr(product, "name", None),
+                    "category_id": getattr(product, "category_id", None),
+                    "price": getattr(product, "price", None),
+                    "old_price": getattr(product, "old_price", None),
+                    "weight": getattr(product, "weight", None),
+                    "width": getattr(product, "width", None),
+                    "height": getattr(product, "height", None),
+                    "depth": getattr(product, "depth", None),
+                }
+                
+                # Все характеристики из attributes
+                attributes = getattr(product, "attributes", [])
+                for attr in attributes:
+                    attr_name = attr.get("name", f"attr_{attr.get('id')}")
+                    attr_value = attr.get("value")
+                    # Если значение — список, преобразуем в строку
+                    if isinstance(attr_value, list):
+                        attr_value = ", ".join([str(v) for v in attr_value])
+                    result[attr_name] = attr_value
+                
+                # Картинки
+                images = getattr(product, "images", [])
+                result["images_count"] = len(images)
+                if images:
+                    result["main_image"] = images[0].get("url", "")
+                
+                results[product.offer_id] = result
+                
+    except Exception as e:
+        st.error(f"Ошибка Ozon API: {e}")
+        st.exception(e)
+    return results
 
-    if USE_PROXIES:
-        PROXY_LIST = [
-            'http://proxy1:port',
-            'http://proxy2:port',
-        ]
+# ============================================
+# 3. ФУНКЦИЯ ДЛЯ ЯНДЕКС МАРКЕТ (все характеристики)
+# ============================================
+async def get_yandex_full_info(article_list):
+    """
+    Получает ВСЕ характеристики товаров через Yandex Market API
+    Метод: POST /v2/campaigns/{campaignId}/offers
+    """
+    results = {}
+    client = YandexMarketClient(api_key=st.secrets["YANDEX_API_KEY"])
+    try:
+        campaigns = await client.campaigns.list_campaigns()
+        if not campaigns:
+            st.warning("Нет активных кампаний в Яндекс Маркет")
+            return results
+        campaign_id = campaigns[0].id
+        
+        # Запрашиваем полную информацию о товарах
+        offers = await client.offers.get_offers(
+            campaign_id,
+            offer_ids=article_list,
+            # Включаем все доступные параметры
+            include=["weight_dimensions", "attributes", "images", "prices"]
+        )
+        
+        for offer in offers:
+            result = {
+                "sku": getattr(offer, "shop_sku", None),
+                "name": getattr(offer, "name", None),
+                "vendor": getattr(offer, "vendor", None),
+                "price": getattr(offer, "price", None),
+                "old_price": getattr(offer, "old_price", None),
+                "category": getattr(offer, "category", None),
+            }
+            
+            # Весогабариты
+            weight_dim = getattr(offer, "weight_dimensions", None)
+            if weight_dim:
+                result["weight"] = getattr(weight_dim, "weight", None)
+                result["width"] = getattr(weight_dim, "width", None)
+                result["height"] = getattr(weight_dim, "height", None)
+                result["depth"] = getattr(weight_dim, "depth", None)
+            
+            # Дополнительные атрибуты
+            attributes = getattr(offer, "attributes", [])
+            for attr in attributes:
+                attr_name = attr.get("name", f"attr_{attr.get('id')}")
+                attr_value = attr.get("value")
+                if isinstance(attr_value, list):
+                    attr_value = ", ".join([str(v) for v in attr_value])
+                result[attr_name] = attr_value
+            
+            results[offer.shop_sku] = result
+            
+    except Exception as e:
+        st.error(f"Ошибка Яндекс API: {e}")
+        st.exception(e)
+    finally:
+        await client.close()
+    return results
 
-    def get_random_proxy():
-        if USE_PROXIES and PROXY_LIST:
-            return {'http': random.choice(PROXY_LIST), 'https': random.choice(PROXY_LIST)}
-        return None
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/105.0.0.0 Safari/537.36"
-    }
-
-    def safe_request(url, headers=None, retries=MAX_RETRIES):
-        attempt = 0
-        while attempt < retries:
-            proxy = get_random_proxy()
+# ============================================
+# 4. ФУНКЦИЯ ДЛЯ WILDBERRIES (все характеристики)
+# ============================================
+async def get_wb_full_info(article_list):
+    """
+    Получает ВСЕ характеристики товаров через Wildberries API
+    Использует Content API и Market API
+    """
+    results = {}
+    try:
+        # Инициализация API
+        api = await WildberriesAPI.build(
+            token=st.secrets["WILDBERRIES_TOKEN"]
+        )
+        
+        for article in article_list:
             try:
-                response = requests.get(url, headers=headers, proxies=proxy, timeout=15)
-                if response.status_code == 200:
-                    if "captcha" in response.text.lower() or "block" in response.text.lower():
-                        logging.warning(f"Обнаружена капча или блокировка на {url}")
-                        time.sleep(10 * attempt)
-                    else:
-                        return response
-                elif response.status_code in [429, 403]:
-                    wait_time = BACKOFF_BASE ** attempt + random.uniform(0, 1)
-                    logging.warning(f"Блокировка (статус {response.status_code}). Повтор через {wait_time:.2f} сек.")
-                    time.sleep(wait_time)
-                else:
-                    response.raise_for_status()
-            except requests.RequestException as e:
-                wait_time = BACKOFF_BASE ** attempt + random.uniform(0, 1)
-                logging.warning(f"Ошибка запроса: {e}. Повтор через {wait_time:.2f} сек.")
-                time.sleep(wait_time)
-            attempt += 1
-        logging.error(f"Не удалось получить {url} после {retries} попыток.")
-        return None
+                # Получаем полную информацию о товаре
+                product = await api.products.get_product(nm_id=article)
+                
+                result = {
+                    "nm_id": getattr(product, "nm_id", None),
+                    "vendor_code": getattr(product, "vendor_code", None),
+                    "name": getattr(product, "name", None),
+                    "brand": getattr(product, "brand", None),
+                    "price": getattr(product, "sale_price", None),
+                    "old_price": getattr(product, "old_price", None),
+                    "discount": getattr(product, "discount", None),
+                    "rating": getattr(product, "rating", None),
+                    "reviews_count": getattr(product, "reviews_count", None),
+                    "weight": getattr(product, "weight", None),  # в граммах
+                    "width": getattr(product, "width", None),    # в см
+                    "height": getattr(product, "height", None),  # в см
+                    "depth": getattr(product, "depth", None),    # в см
+                    "category": getattr(product, "category", None),
+                    "subject_id": getattr(product, "subject_id", None),
+                }
+                
+                # Дополнительные характеристики
+                characteristics = getattr(product, "characteristics", [])
+                for char in characteristics:
+                    name = char.get("name", f"char_{char.get('id')}")
+                    value = char.get("value")
+                    if isinstance(value, list):
+                        value = ", ".join([str(v) for v in value])
+                    result[name] = value
+                
+                # Картинки
+                images = getattr(product, "images", [])
+                result["images_count"] = len(images)
+                if images:
+                    result["main_image"] = images[0].get("url", "")
+                
+                results[str(article)] = result
+                await asyncio.sleep(random.uniform(0.5, 1.0))
+                
+            except Exception as e:
+                results[str(article)] = {"error": str(e)}
+        
+        await api.close()
+        
+    except Exception as e:
+        st.error(f"Ошибка Wildberries API: {e}")
+        st.exception(e)
+    return results
 
-    def save_product_csv(product_data, filename):
-        df = pd.DataFrame([product_data], columns=["link", "title", "price", "images", "description", "characteristics"])
-        if os.path.exists(filename):
-            df.to_csv(filename, mode='a', index=False, header=False)
+# ============================================
+# 5. ОСНОВНОЙ ИНТЕРФЕЙС STREAMLIT
+# ============================================
+st.set_page_config(
+    page_title="Полный парсер характеристик товаров",
+    page_icon="📦",
+    layout="wide"
+)
+
+st.title("📦 Полный сбор всех характеристик товаров")
+st.caption("Сбор всех параметров, атрибутов и характеристик с трех маркетплейсов")
+
+# --- СТИЛИ ---
+st.markdown("""
+<style>
+.stProgress > div > div > div > div {
+    background-color: #FF6B00;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# --- БОКОВАЯ ПАНЕЛЬ ---
+with st.sidebar:
+    st.header("⚙️ Настройки")
+    
+    marketplace = st.selectbox(
+        "Выберите маркетплейс",
+        options=["Ozon", "Яндекс Маркет", "Wildberries", "Все маркетплейсы"]
+    )
+    
+    batch_size = st.number_input(
+        "Размер батча",
+        min_value=5,
+        max_value=100,
+        value=20,
+        help="Рекомендуется 20-50 для стабильности"
+    )
+    
+    st.divider()
+    
+    # Дополнительные опции
+    include_images = st.checkbox("Включить ссылки на изображения", value=True)
+    include_attributes = st.checkbox("Включить все атрибуты", value=True)
+    
+    st.divider()
+    st.caption("🔑 API-ключи в secrets.toml")
+    st.caption("📌 Поддерживаются: Ozon, Яндекс Маркет, Wildberries")
+
+# --- ЗАГРУЗКА ФАЙЛА ---
+uploaded_file = st.file_uploader(
+    "📁 Загрузите Excel-файл с артикулами",
+    type=["xlsx", "xls", "csv"],
+    help="Первый столбец — артикулы продавца"
+)
+
+if uploaded_file:
+    try:
+        # Определяем формат файла
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
         else:
-            df.to_csv(filename, mode='w', index=False)
-
-    def save_product_sqlite(cursor, product_data):
-        cursor.execute('''
-            INSERT OR REPLACE INTO products (link, title, price, images, description, characteristics)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', product_data)
-        if save_format == "SQLite":
-            conn.commit()
-
-    def parse_product(link):
-        response = safe_request(link)
-        if response:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            title_tag = soup.find('h1', {'class': 'title'})
-            title = title_tag.text.strip() if title_tag else ''
-            price_tag = soup.find('ins', {'class': 'price-block__final-price'})
-            price = price_tag.text.strip() if price_tag else ''
-            images = [img.get('src') for img in soup.find_all('img', {'class': 'swiper-slide__img'})]
-            description = ''
-            desc_tag = soup.find('div', {'class': 'product-page__description'})
-            if desc_tag:
-                description = desc_tag.text.strip()
-            characteristics = {}
-            details = soup.find('div', {'class': 'product-details'})
-            if details:
-                for row in details.find_all('div', {'class': 'product-details__row'}):
-                    key_tag = row.find('div', {'class': 'product-details__name'})
-                    value_tag = row.find('div', {'class': 'product-details__value'})
-                    if key_tag and value_tag:
-                        key = key_tag.text.strip().lower()
-                        value = value_tag.text.strip()
-                        characteristics[key] = value
-            return (
-                link,
-                title,
-                price,
-                '; '.join(images),
-                description,
-                '; '.join([f"{k}: {v}" for k, v in characteristics.items()])
-            )
-        return None
-
-    def get_store_products(store_url):
-        page = 1
-        total_products = 0
-        while True:
-            if st.session_state['stop']:
-                break
-            if st.session_state['pause']:
-                time.sleep(1)
-                continue
-            url = f"{store_url}?page={page}"
-            response = safe_request(url)
-            if response:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                product_cards = soup.find_all('a', {'class': 'product-card__main'})
-                if not product_cards:
-                    break
-                for a in product_cards:
-                    link = 'https://wildberries.ru' + a['href']
-                    product_data = parse_product(link)
-                    if product_data:
-                        if save_format == "CSV":
-                            save_product_csv(product_data, filename_csv)
-                        elif save_format == "SQLite":
-                            save_product_sqlite(cursor, product_data)
-                        st.session_state['progress'] += 1
-                        progress = st.session_state['progress']
-                        st.write(f'Обработано товаров: {progress}')
-                        st.progress(progress / 1000)  # Настройте по необходимости
-                        time.sleep(DELAY_BETWEEN_REQUESTS)
-                next_btn = soup.find('a', {'class': 'pagination__next'})
-                if not next_btn or 'disabled' in next_btn.get('class', []):
-                    break
-                else:
-                    page += 1
+            df = pd.read_excel(uploaded_file, engine="openpyxl")
+        
+        st.success(f"✅ Загружено: {len(df)} артикулов")
+        article_column = df.columns[0]
+        articles = df[article_column].astype(str).tolist()
+        
+        # Предпросмотр
+        with st.expander("📋 Предпросмотр загруженных данных"):
+            st.dataframe(df.head(10))
+            st.caption(f"Всего артикулов: {len(articles)}")
+        
+        # Кнопка запуска
+        if st.button("🚀 Запустить сбор всех характеристик", type="primary"):
+            # --- ИНИЦИАЛИЗАЦИЯ ---
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            # Контейнер для результатов
+            all_results = {}
+            
+            # --- АСИНХРОННЫЙ СБОР ---
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            total_batches = (len(articles) + batch_size - 1) // batch_size
+            
+            for idx, i in enumerate(range(0, len(articles), batch_size)):
+                batch = articles[i:i+batch_size]
+                status_text.text(f"📊 Обработка батча {idx+1}/{total_batches}...")
+                
+                # Выбор маркетплейса
+                try:
+                    if marketplace in ["Ozon", "Все маркетплейсы"]:
+                        data = loop.run_until_complete(get_ozon_full_info(batch))
+                        for art, vals in data.items():
+                            if "error" not in vals:
+                                key = f"Ozon_{art}"
+                                all_results[key] = vals
+                            else:
+                                all_results[f"Ozon_{art}"] = {"error": vals.get("error")}
+                    
+                    if marketplace in ["Яндекс Маркет", "Все маркетплейсы"]:
+                        data = loop.run_until_complete(get_yandex_full_info(batch))
+                        for art, vals in data.items():
+                            if "error" not in vals:
+                                key = f"Yandex_{art}"
+                                all_results[key] = vals
+                            else:
+                                all_results[f"Yandex_{art}"] = {"error": vals.get("error")}
+                    
+                    if marketplace in ["Wildberries", "Все маркетплейсы"]:
+                        data = loop.run_until_complete(get_wb_full_info(batch))
+                        for art, vals in data.items():
+                            if "error" not in vals:
+                                key = f"WB_{art}"
+                                all_results[key] = vals
+                            else:
+                                all_results[f"WB_{art}"] = {"error": vals.get("error")}
+                    
+                except Exception as e:
+                    st.error(f"Ошибка в батче {idx+1}: {e}")
+                
+                # Обновление прогресса
+                progress_bar.progress((idx + 1) / total_batches)
+            
+            status_text.text("✅ Сбор всех характеристик завершен!")
+            
+            # --- ФОРМИРОВАНИЕ РЕЗУЛЬТАТА ---
+            if all_results:
+                # Преобразуем в DataFrame
+                rows = []
+                for key, values in all_results.items():
+                    row = {"Артикул": key}
+                    if isinstance(values, dict):
+                        row.update(values)
+                    else:
+                        row["error"] = str(values)
+                    rows.append(row)
+                
+                result_df = pd.DataFrame(rows)
+                
+                # Убираем колонку с ошибками, если все успешно
+                if "error" in result_df.columns:
+                    error_count = result_df["error"].notna().sum()
+                    if error_count > 0:
+                        st.warning(f"⚠️ {error_count} записей содержат ошибки")
+                    else:
+                        result_df = result_df.drop(columns=["error"])
+                
+                # Показываем результат
+                st.subheader(f"📊 Собрано характеристик: {len(result_df.columns)} колонок")
+                st.dataframe(result_df, use_container_width=True)
+                
+                # --- ЭКСПОРТ В EXCEL ---
+                st.subheader("📥 Экспорт данных")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Экспорт в Excel (все данные)
+                    output = BytesIO()
+                    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                        result_df.to_excel(writer, index=False, sheet_name="Характеристики")
+                        
+                        # Настройка ширины колонок
+                        worksheet = writer.sheets["Характеристики"]
+                        for column in worksheet.columns:
+                            max_length = 0
+                            column_letter = column[0].column_letter
+                            for cell in column:
+                                try:
+                                    if len(str(cell.value)) > max_length:
+                                        max_length = len(str(cell.value))
+                                except:
+                                    pass
+                            adjusted_width = min(max_length + 2, 50)
+                            worksheet.column_dimensions[column_letter].width = adjusted_width
+                    
+                    st.download_button(
+                        label="⬇️ Скачать Excel (все характеристики)",
+                        data=output.getvalue(),
+                        file_name=f"all_characteristics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                
+                with col2:
+                    # Экспорт только базовых характеристик
+                    base_cols = ["Артикул", "name", "price", "weight", "width", "height", "depth"]
+                    existing_cols = [col for col in base_cols if col in result_df.columns]
+                    if len(existing_cols) > 1:
+                        base_df = result_df[existing_cols]
+                        output_base = BytesIO()
+                        with pd.ExcelWriter(output_base, engine="openpyxl") as writer:
+                            base_df.to_excel(writer, index=False, sheet_name="Базовые характеристики")
+                        
+                        st.download_button(
+                            label="⬇️ Скачать Excel (только базовые)",
+                            data=output_base.getvalue(),
+                            file_name=f"base_characteristics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                
+                # --- СТАТИСТИКА ---
+                with st.expander("📈 Статистика собранных данных"):
+                    col3, col4, col5 = st.columns(3)
+                    with col3:
+                        st.metric("Всего товаров", len(result_df))
+                    with col4:
+                        st.metric("Всего характеристик", len(result_df.columns) - 1)
+                    with col5:
+                        # Считаем количество заполненных полей
+                        filled = result_df.select_dtypes(include=['object']).apply(lambda x: x.notna().sum())
+                        avg_filled = filled.mean() if len(filled) > 0 else 0
+                        st.metric("Среднее заполнение", f"{avg_filled:.0f}%")
+            
             else:
-                break
-        return total_products
+                st.error("❌ Не удалось собрать данные. Проверьте API-ключи.")
+            
+            loop.close()
+            
+    except Exception as e:
+        st.error(f"❌ Ошибка: {e}")
+        st.exception(e)
 
-    def collect_full_store():
-        store_url = st.text_input("Введите ссылку магазина для сбора всех товаров", value='https://wildberries.ru/категории/автозапчасти')
-        if st.button("Собрать все товары магазина"):
-            st.session_state['stop'] = False
-            total_collected = get_store_products(store_url)
-            st.write(f"Обработано товаров: {st.session_state['progress']}")
-
-    def run():
-        # Можно запускать разные функции
-        pass
-
-    # Запуск по кнопкам
-    if st.button("Запустить парсинг"):
-        st.session_state['stop'] = False
-        threading.Thread(target=run).start()
-
-    if st.button("Остановить парсинг"):
-        st.session_state['stop'] = True
-
-    if st.button("Пауза/Продолжить"):
-        st.session_state['pause'] = not st.session_state['pause']
-
-    # Вызов функции для сбора всего магазина
-    collect_full_store()
-
-# Запускаем main
-if __name__ == "__main__":
-    main()
+# ============================================
+# 6. ПОМОЩЬ И ПОДСКАЗКИ
+# ============================================
+with st.expander("🔑 Как получить API-ключи"):
+    st.markdown("""
+    ### Ozon Seller API
+    Перейдите в [Ozon Seller API](https://seller-api.ozon.ru/)
+    - Создайте приложение и получите Client ID и API Key
+    - Необходимые права: product_info
+    
+    ### Яндекс Маркет Partner API
+    Перейдите в [Яндекс Маркет для продавцов](https://partner.market.yandex.ru/)
+    - В разделе API получите OAuth-токен
+    - Необходимые права: offers, prices
+    
+    ### Wildberries API
+    Перейдите в [Wildberries Developers](https://dev.wildberries.ru/)
+    - Получите токен продавца в личном кабинете
+    - Необходимые права: content, products
+    
+    ### Настройка secrets.toml
+    Создайте файл `.streamlit/secrets.toml`:
+    ```toml
+    OZON_CLIENT_ID = "ваш_client_id"
+    OZON_API_KEY = "ваш_api_key"
+    YANDEX_API_KEY = "ваш_токен"
+    WILDBERRIES_TOKEN = "ваш_токен"
