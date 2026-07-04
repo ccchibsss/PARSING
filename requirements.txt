@@ -1,4 +1,20 @@
-requests
-pandas
-streamlit
-beautifulsoup4
+# Основные фреймворки и библиотеки
+streamlit>=1.28.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# Асинхронные клиенты для API маркетплейсов
+ozonapi-async>=1.0.0
+yandex-market-api>=0.3.0
+wildberries-api>=1.0.0
+
+# HTTP-клиенты и утилиты
+aiohttp>=3.9.0
+aiohttp-socks>=0.8.0
+curl-cffi>=0.5.0
+
+# Для работы с прокси и обходом блокировок
+python-socks>=2.0.0
+
+# Дополнительные утилиты
+python-dotenv>=1.0.0
