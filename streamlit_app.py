@@ -844,7 +844,7 @@ class HighVolumeAutoPartsCatalog:
             return 0.0
     
     # ========================================================================
-    # ✅ НОВЫЙ МЕТОД: VLOOKUP-стиль чтения файлов
+    # ✅ НОВЫЙ МЕТОД: VLOOKUP-стиль чтения файлов (С БЕЗОПАСНЫМ FALLBACK)
     # ========================================================================
     def read_file_with_column_selection(self, file_path: str, 
                                        required_columns: List[str] = None,
@@ -869,6 +869,7 @@ class HighVolumeAutoPartsCatalog:
         try:
             if not os.path.exists(file_path):
                 logger.error(f"Файл не найден: {file_path}")
+                st.error(f"❌ Файл не найден: {Path(file_path).name}")
                 return pl.DataFrame()
             
             # Определяем тип файла
@@ -877,10 +878,34 @@ class HighVolumeAutoPartsCatalog:
             if file_ext == '.csv':
                 df = pl.read_csv(file_path, try_parse_dates=False)
             else:
-                df = pl.read_excel(file_path, engine='calamine')
+                # Попытка использовать быстрый движок calamine (требует fastexcel)
+                try:
+                    df = pl.read_excel(file_path, engine='calamine')
+                except ModuleNotFoundError as e:
+                    if 'fastexcel' in str(e).lower():
+                        error_msg = (
+                            "❌ Критическая ошибка: Отсутствует библиотека 'fastexcel'.\n"
+                            "Пожалуйста, добавьте 'fastexcel>=0.9.0' в ваш requirements.txt, "
+                            "закоммитьте изменения и перезапустите приложение в Streamlit Cloud."
+                        )
+                        logger.error(error_msg)
+                        st.error(error_msg)
+                        return pl.DataFrame()
+                    else:
+                        raise e
+                except Exception as e:
+                    # Фоллбэк на openpyxl, если calamine не справился с конкретным файлом
+                    logger.warning(f"Не удалось прочитать через calamine, пробуем openpyxl: {e}")
+                    try:
+                        df = pl.read_excel(file_path, engine='openpyxl')
+                    except Exception as e_fallback:
+                        logger.error(f"Ошибка чтения файла {file_path} через openpyxl: {e_fallback}")
+                        st.error(f"❌ Ошибка чтения Excel файла '{Path(file_path).name}'. Убедитесь, что файл не поврежден, не защищен паролем и имеет корректный формат.")
+                        return pl.DataFrame()
             
             if df.is_empty():
                 logger.warning(f"Пустой файл: {file_path}")
+                st.warning(f"⚠️ Файл '{Path(file_path).name}' пуст или не содержит табличных данных.")
                 return pl.DataFrame()
             
             logger.info(f"Исходные колонки: {df.columns}")
@@ -907,6 +932,7 @@ class HighVolumeAutoPartsCatalog:
             
             if not column_mapping:
                 logger.warning(f"Не удалось определить колонки в файле {file_path}")
+                st.warning(f"⚠️ Не удалось автоматически сопоставить колонки в '{Path(file_path).name}'. Проверьте заголовки файла.")
                 return pl.DataFrame()
             
             # Переименовываем колонки
@@ -942,7 +968,8 @@ class HighVolumeAutoPartsCatalog:
             return df
             
         except Exception as e:
-            logger.exception(f"Ошибка чтения файла {file_path}: {e}")
+            logger.exception(f"Непредвиденная ошибка чтения файла {file_path}: {e}")
+            st.error(f"❌ Произошла непредвиденная ошибка при обработке '{Path(file_path).name}'. Подробности в логах.")
             return pl.DataFrame()
     
     # ========================================================================
@@ -1953,8 +1980,20 @@ class HighVolumeAutoPartsCatalog:
             temp_path.write_bytes(uploaded_file.getvalue())
             
             try:
-                # Читаем заголовки для предпросмотра
-                preview_df = pl.read_excel(temp_path, engine='calamine') if temp_path.suffix != '.csv' else pl.read_csv(temp_path)
+                # Читаем заголовки для предпросмотра с безопасным фоллбэком
+                if temp_path.suffix != '.csv':
+                    try:
+                        preview_df = pl.read_excel(temp_path, engine='calamine')
+                    except ModuleNotFoundError as e:
+                        if 'fastexcel' in str(e).lower():
+                            st.error("❌ Отсутствует библиотека 'fastexcel'. Добавьте 'fastexcel>=0.9.0' в requirements.txt и перезапустите приложение.")
+                            return
+                        else:
+                            raise e
+                    except Exception:
+                        preview_df = pl.read_excel(temp_path, engine='openpyxl')
+                else:
+                    preview_df = pl.read_csv(temp_path)
                 
                 st.write("**Доступные колонки в файле:**")
                 st.write(", ".join(preview_df.columns))
