@@ -716,7 +716,7 @@ class HighVolumeAutoPartsCatalog:
         """
         st.info("🔄 Начало загрузки и обновления данных в базе...")
         
-        steps = [s for s in ['oe', 'cross', 'parts'] if s in dataframes]
+        steps = [s for s in ['oe', 'cross', 'parts', 'prices'] if s in dataframes]
         num_steps = len(steps)
         
         progress_bar = st.progress(0, text="Подготовка к обновлению базы данных...")
@@ -732,13 +732,24 @@ class HighVolumeAutoPartsCatalog:
             
             df = dataframes['oe'].filter(pl.col('oe_number_norm') != "")
             
-            # Гарантируем наличие всех размерных колонок
-            for dim_col in ['length', 'width', 'height', 'weight']:
-                if dim_col not in df.columns:
-                    df = df.with_columns(pl.lit(0.0).cast(pl.Float64).alias(dim_col))
-            if 'dimensions_str' not in df.columns:
-                df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias('dimensions_str'))
+            # ГАРАНТИРОВАННОЕ ДОБАВЛЕНИЕ ВСЕХ НЕОБХОДИМЫХ КОЛОНОК ПЕРЕД SELECT
+            # Это предотвращает polars.exceptions.ColumnNotFoundError
+            required_oe_cols = {
+                'oe_number': pl.lit("").cast(pl.Utf8),
+                'name': pl.lit("").cast(pl.Utf8),
+                'applicability': pl.lit("").cast(pl.Utf8),
+                'length': pl.lit(0.0).cast(pl.Float64),
+                'width': pl.lit(0.0).cast(pl.Float64),
+                'height': pl.lit(0.0).cast(pl.Float64),
+                'weight': pl.lit(0.0).cast(pl.Float64),
+                'dimensions_str': pl.lit(None).cast(pl.Utf8)
+            }
             
+            for col, default_expr in required_oe_cols.items():
+                if col not in df.columns:
+                    df = df.with_columns(default_expr.alias(col))
+            
+            # Теперь select безопасен на 100%
             oe_df = df.select([
                 'oe_number_norm', 'oe_number', 'name', 'applicability',
                 'length', 'width', 'height', 'weight', 'dimensions_str'
@@ -774,10 +785,17 @@ class HighVolumeAutoPartsCatalog:
             progress_bar.progress(step_counter / (num_steps + 1),
                                   text=f"({step_counter}/{num_steps}) Обработка кроссов...")
             
-            df = dataframes['cross'].filter(
-                (pl.col('oe_number_norm') != "") & (pl.col('artikul_norm') != ""))
-            cross_df_from_cross = df.select(
-                ['oe_number_norm', 'artikul_norm', 'brand_norm']).unique()
+            df = dataframes['cross']
+            
+            # Гарантируем наличие ключей для фильтрации и выбора
+            for col in ['oe_number_norm', 'artikul_norm', 'brand_norm']:
+                if col not in df.columns:
+                    df = df.with_columns(pl.lit("").cast(pl.Utf8).alias(col))
+            
+            cross_df_from_cross = df.filter(
+                (pl.col('oe_number_norm') != "") & (pl.col('artikul_norm') != "")
+            ).select(['oe_number_norm', 'artikul_norm', 'brand_norm']).unique()
+            
             self.upsert_data('cross_references', cross_df_from_cross, [
                 'oe_number_norm', 'artikul_norm', 'brand_norm'])
         
@@ -810,7 +828,7 @@ class HighVolumeAutoPartsCatalog:
             ]
             
             if parts_to_concat:
-                all_parts = pl.concat(parts_to_concat).filter(
+                all_parts = pl.concat(parts_to_concat, how="diagonal_relaxed").filter(
                     pl.col('artikul_norm') != ""
                 ).unique(subset=['artikul_norm', 'brand_norm'], keep='first')
                 parts_df = all_parts
@@ -1214,7 +1232,7 @@ class HighVolumeAutoPartsCatalog:
             FROM parts p
             LEFT JOIN PartDetails pd ON p.artikul_norm = pd.artikul_norm AND p.brand_norm = pd.brand_norm
             LEFT JOIN AllAnalogs aa ON p.artikul_norm = aa.artikul_norm AND p.brand_norm = aa.brand_norm
-            LEFT JOIN AggregatedAnalogData p_analog ON p.artikul_norm = p_analog.artikul_norm AND p.analog.brand_norm = p_analog.brand_norm
+            LEFT JOIN AggregatedAnalogData p_analog ON p.artikul_norm = p_analog.artikul_norm AND p.brand_norm = p_analog.brand_norm
         )
         """
         
@@ -2010,73 +2028,89 @@ class HighVolumeAutoPartsCatalog:
         st.divider()
         
         # ------------------------------------------------------------------
-        # Массовая загрузка (автоматический маппинг по эвристике) + параллельная обработка
+        # Массовая загрузка (автоматический маппинг по эвристике + объединение нескольких таблиц)
         # ------------------------------------------------------------------
-        st.subheader("⚡ Массовая загрузка (параллельная)")
-        st.caption("Загрузите несколько файлов одновременно. Тип определяется автоматически по имени файла.")
+        st.subheader("⚡ Массовая загрузка нескольких файлов")
+        st.caption("Загрузите несколько файлов одновременно. Тип определяется автоматически по имени файла. Файлы одного типа будут объединены.")
         
         uploaded_files = st.file_uploader(
             "Выберите несколько файлов:",
             type=["xlsx", "xls", "csv"],
             accept_multiple_files=True,
-            key="bulk_upload"
+            key="bulk_upload_multi"
         )
         
-        # Проверка расширений файлов
         if uploaded_files:
-            invalid_files = [f for f in uploaded_files if Path(f.name).suffix.lower() not in ['.xlsx', '.xls', '.csv']]
-            if invalid_files:
-                st.error(f"Неподдерживаемые типы файлов: {[f.name for f in invalid_files]}")
-                uploaded_files = [f for f in uploaded_files if f not in invalid_files]
-        
-        if uploaded_files:
-            file_map = {}
+            # Группировка файлов по определенному типу
+            files_by_type = {
+                'oe': [], 'cross': [], 'prices': [], 
+                'dimensions': [], 'barcode': [], 'images': [], 'universal': []
+            }
+            
             for file in uploaded_files:
                 name_lower = file.name.lower()
-                if any(kw in name_lower for kw in ["oe", "o-e", "original"]):
-                    file_map["oe"] = file
-                elif any(kw in name_lower for kw in ["cross", "крест", "аналог"]):
-                    file_map["cross"] = file
-                elif any(kw in name_lower for kw in ["price", "цена", "cost"]):
-                    file_map["prices"] = file
-                elif any(kw in name_lower for kw in ["dim", "размер", "габарит"]):
-                    file_map["dimensions"] = file
-                elif any(kw in name_lower for kw in ["bar", "штрих", "ean"]):
-                    file_map["barcode"] = file
-                elif any(kw in name_lower for kw in ["img", "фото", "image"]):
-                    file_map["images"] = file
-                else:
-                    file_map["universal"] = file
+                detected_type = 'universal'
+                if any(kw in name_lower for kw in ["oe", "o-e", "original", "оригинал"]):
+                    detected_type = 'oe'
+                elif any(kw in name_lower for kw in ["cross", "крест", "аналог", "кросс"]):
+                    detected_type = 'cross'
+                elif any(kw in name_lower for kw in ["price", "цена", "cost", "прайс"]):
+                    detected_type = 'prices'
+                elif any(kw in name_lower for kw in ["dim", "размер", "габарит", "вес"]):
+                    detected_type = 'dimensions'
+                elif any(kw in name_lower for kw in ["bar", "штрих", "ean", "barcode"]):
+                    detected_type = 'barcode'
+                elif any(kw in name_lower for kw in ["img", "фото", "image", "картинка"]):
+                    detected_type = 'images'
+                
+                files_by_type[detected_type].append(file)
+
+            # Убираем пустые категории
+            files_by_type = {k: v for k, v in files_by_type.items() if v}
             
-            st.write(f"Определено **{len(file_map)}** типов файлов:")
-            for ft, f in file_map.items():
-                st.write(f"- `{ft}` → `{f.name}`")
+            st.write(f"📂 Распределено файлов по категориям: **{ {k: len(v) for k, v in files_by_type.items()} }**")
             
-            if st.button("📦 Загрузить все (параллельно)", key="bulk_upload_button"):
-                with st.spinner("Параллельная обработка и загрузка всех файлов..."):
-                    temp_paths = []
-                    file_paths = {}
+            if st.button("📦 Загрузить и объединить все файлы", key="bulk_upload_button_multi"):
+                with st.spinner("Обработка, объединение и загрузка всех файлов..."):
+                    all_dataframes = {}
+                    temp_paths_to_clean = []
                     
                     try:
-                        for ft, file in file_map.items():
-                            temp_path = self.data_dir / f"temp_{int(time.time())}_{file.name}"
-                            with open(temp_path, "wb") as f_out:
-                                f_out.write(file.getbuffer())
-                            temp_paths.append(temp_path)
-                            file_paths[ft] = str(temp_path)
-                        
-                        # Параллельная обработка файлов
-                        dataframes = self.merge_all_data_parallel(file_paths, max_workers=4)
-                        
-                        if dataframes:
-                            self.process_and_load_data(dataframes)
-                            st.success("✅ Все данные успешно загружены в базу!")
+                        for ftype, files in files_by_type.items():
+                            type_dfs = []
+                            for file in files:
+                                temp_path = self.data_dir / f"temp_{int(time.time() * 1000)}_{file.name}"
+                                with open(temp_path, "wb") as f_out:
+                                    f_out.write(file.getbuffer())
+                                temp_paths_to_clean.append(temp_path)
+                                
+                                # Читаем и подготавливаем каждый файл
+                                df = self.read_and_prepare_file(str(temp_path), ftype)
+                                if not df.is_empty():
+                                    type_dfs.append(df)
+                            
+                            # Объединяем все датафреймы одного типа
+                            if type_dfs:
+                                # diagonal_relaxed позволяет объединять датафреймы с разным набором колонок
+                                combined_df = pl.concat(type_dfs, how="diagonal_relaxed")
+                                
+                                # Удаляем полные дубликаты по ключевым колонкам после объединения
+                                key_cols = [c for c in ['oe_number_norm', 'artikul_norm', 'brand_norm'] if c in combined_df.columns]
+                                if key_cols:
+                                    combined_df = combined_df.unique(subset=key_cols, keep='first')
+                                
+                                all_dataframes[ftype] = combined_df
+                                st.success(f"✅ Обработано и объединено {len(files)} файл(ов) типа '{ftype}' (всего строк: {len(combined_df)})")
+
+                        if all_dataframes:
+                            self.process_and_load_data(all_dataframes)
+                            st.success("🎉 Все данные успешно загружены и обновлены в базе!")
                             st.rerun()
                         else:
-                            st.warning("Не найдено данных для загрузки")
+                            st.warning("⚠️ Не найдено валидных данных для загрузки")
                     
                     finally:
-                        for tp in temp_paths:
+                        for tp in temp_paths_to_clean:
                             tp.unlink(missing_ok=True)
 
     # ========================================================================
