@@ -1,50 +1,47 @@
-# ============================================================================
-# БЛОК 11: HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ПОЛНАЯ ВЕРСИЯ v100.21 + УЛУЧШЕНИЯ)
-# ============================================================================
-# ✅ ИСПРАВЛЕНИЯ v100.21 (СОХРАНЕНЫ ПОЛНОСТЬЮ, БЕЗ ЕДИНОГО СОКРАЩЕНИЯ):
-# 1. ИСПРАВЛЕНА ОШИБКА "table oe has 10 columns but 5 values were supplied"
-# 2. Добавлены ВСЕ колонки в oe_df (включая length, width, height, weight, dimensions_str)
-# 3. Гарантированное создание колонок с габаритами, даже если их нет в исходных данных
-# 4. Правильный порядок колонок при вставке в таблицу oe
-# 5. ПОЛНОЕ ИСПРАВЛЕНИЕ ПРОБЛЕМЫ С ДАТАМИ В ГАБАРИТАХ
-# 6. Приоритет габаритов: данные > OE > аналоги
-# 7. Гарантированное заполнение всех 4 колонок (Длинна, Ширина, Высота, Вес)
-#
-# ✅ НОВЫЕ ВОЗМОЖНОСТИ (ДОБАВЛЕНЫ БЕЗ УДАЛЕНИЯ ОРИГИНАЛА):
-# 8. Потоковый экспорт (Streaming CSV/Excel) для экономии RAM при больших объемах
-# 9. Интерфейс "Power Query" для выбора столбцов и фильтрации перед экспортом
-# ============================================================================
-
 import streamlit as st
-import polars as pl
 import pandas as pd
-import duckdb
-import json
-import os
-import re
+import numpy as np
+from pathlib import Path
 import io
+import os
+import json
+import logging
+from typing import Dict, List, Tuple, Optional, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import math
+import re
 import decimal
-from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple, Callable
 from datetime import datetime, date, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import logging
+import polars as pl
+import duckdb
+import tempfile
+from zipfile import ZipFile
+import threading
+import hashlib
+from collections import OrderedDict
+import gc
+
+# Импорты для Excel/CSV
+import pyarrow as pa
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Константы
-EXCEL_ROW_LIMIT = 1_048_576
-CHUNK_SIZE = 100_000
+EXCEL_ROW_LIMIT = 1_048_576  # Максимум строк в Excel
+
+# ============================================================================
+# БЛОК 11: HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ПОЛНАЯ ВЕРСИЯ v100.21)
+# ============================================================================
 
 @st.cache_resource
 def get_high_volume_catalog():
     """Создание каталога через st.cache_resource для корректной работы с DuckDB"""
     return HighVolumeAutoPartsCatalog()
-
 
 class HighVolumeAutoPartsCatalog:
     def __init__(self):
@@ -889,70 +886,7 @@ class HighVolumeAutoPartsCatalog:
         progress_bar.progress(1.0, text="Обновление базы данных завершено!")
         time.sleep(1)
         progress_bar.empty()
-
-    # ========================================================================
-    # ✅ НОВЫЕ МЕТОДЫ: ПОТОКОВЫЙ ЭКСПОРТ (v100.22)
-    # ========================================================================
-    def export_streaming_csv(self, query: str, output_path: str) -> bool:
-        """Использует нативный COPY DuckDB для потоковой записи на диск без загрузки в RAM"""
-        try:
-            abs_path = Path(output_path).resolve()
-            self.conn.execute(f"COPY ({query}) TO '{abs_path}' (HEADER, DELIMITER ';')")
-            return True
-        except Exception as e:
-            logger.error(f"CSV Export Error: {e}")
-            st.error(f"Ошибка экспорта CSV: {e}")
-            return False
-
-    def export_streaming_excel(self, query: str, output_path: str) -> bool:
-        """Чанковая запись в Excel для предотвращения OOM (Out Of Memory)"""
-        try:
-            abs_path = Path(output_path).resolve()
-            count_query = f"SELECT COUNT(*) FROM ({query})"
-            total_rows = self.conn.execute(count_query).fetchone()[0]
-            
-            if total_rows == 0:
-                st.warning("Нет данных для экспорта.")
-                return False
-
-            if total_rows > EXCEL_ROW_LIMIT:
-                st.warning(f"Внимание: Excel имеет лимит ~{EXCEL_ROW_LIMIT} строк. Будет экспортировано только первые {EXCEL_ROW_LIMIT} строк.")
-                query = f"{query} LIMIT {EXCEL_ROW_LIMIT}"
-                total_rows = EXCEL_ROW_LIMIT
-
-            progress_bar = st.progress(0, text="Потоковая запись Excel...")
-            
-            rel = self.conn.execute(query)
-            first_chunk = True
-            rows_written = 0
-            
-            with pd.ExcelWriter(abs_path, engine='openpyxl') as writer:
-                while True:
-                    chunk = rel.fetchmany(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    
-                    col_names = [desc[0] for desc in rel.description]
-                    df_chunk = pd.DataFrame(chunk, columns=col_names)
-                    
-                    df_chunk.to_excel(
-                        writer, 
-                        sheet_name='Данные', 
-                        index=False, 
-                        header=first_chunk, 
-                        startrow=rows_written if not first_chunk else 0
-                    )
-                    rows_written += len(df_chunk)
-                    first_chunk = False
-                    progress_bar.progress(min(1.0, rows_written / total_rows))
-            
-            progress_bar.empty()
-            return True
-        except Exception as e:
-            logger.error(f"Excel Export Error: {e}")
-            st.error(f"Ошибка экспорта Excel: {e}")
-            return False
-
+    
     # ========================================================================
     # ЭКСПОРТ (✅ v100.20 - ГАРАНТИРОВАННОЕ ЗАПОЛНЕНИЕ ГАБАРИТОВ)
     # ========================================================================
@@ -1432,97 +1366,6 @@ class HighVolumeAutoPartsCatalog:
             logger.error(f"Ошибка сбора статистики: {e}")
         
         return stats
-
-    # ========================================================================
-    # ✅ НОВЫЙ ИНТЕРФЕЙС: POWER QUERY КОНСТРУКТОР (v100.22)
-    # ========================================================================
-    def show_power_query_interface(self):
-        st.header("🔧 Конструктор данных (Power Query)")
-        st.info("Загрузите файл, выберите нужные столбцы и примените фильтры перед экспортом.")
-        
-        uploaded_file = st.file_uploader("Загрузите файл Excel или CSV", type=['xlsx', 'xls', 'csv'], key="pq_upload")
-        if not uploaded_file:
-            return
-            
-        temp_path = self.data_dir / f"temp_pq_{uploaded_file.name}"
-        temp_path.write_bytes(uploaded_file.getvalue())
-        
-        try:
-            file_type = 'universal'
-            df = self.read_and_prepare_file(str(temp_path), file_type)
-            
-            if df.is_empty():
-                st.warning("Не удалось прочитать файл или он пуст.")
-                return
-                
-            st.success(f"Файл успешно прочитан! Найдено {len(df)} строк и {len(df.columns)} колонок.")
-            
-            st.subheader("1. Выбор столбцов для экспорта")
-            all_cols = df.columns
-            display_cols = [c for c in all_cols if not c.endswith('_norm')]
-            selected_cols = st.multiselect("Выберите столбцы:", display_cols, default=display_cols)
-            
-            st.subheader("2. Фильтрация данных (необязательно)")
-            add_filter = st.checkbox("Добавить фильтр")
-            filtered_df = df
-            
-            if add_filter and selected_cols:
-                col1, col2, col3 = st.columns([3, 2, 3])
-                with col1:
-                    filter_col = st.selectbox("Столбец", selected_cols)
-                with col2:
-                    filter_op = st.selectbox("Оператор", ["==", "!=", ">", "<", "contains"])
-                with col3:
-                    filter_val = st.text_input("Значение")
-                
-                if st.button("Применить фильтр"):
-                    try:
-                        if filter_op == "==":
-                            filtered_df = df.filter(pl.col(filter_col) == filter_val)
-                        elif filter_op == "!=":
-                            filtered_df = df.filter(pl.col(filter_col) != filter_val)
-                        elif filter_op == ">":
-                            filtered_df = df.filter(pl.col(filter_col) > float(filter_val))
-                        elif filter_op == "<":
-                            filtered_df = df.filter(pl.col(filter_col) < float(filter_val))
-                        elif filter_op == "contains":
-                            filtered_df = df.filter(pl.col(filter_col).str.contains(filter_val, literal=True))
-                        st.success(f"Фильтр применен. Осталось строк: {len(filtered_df)}")
-                    except Exception as e:
-                        st.error(f"Ошибка фильтрации: {e}")
-            
-            st.subheader("3. Предпросмотр результата")
-            st.dataframe(filtered_df.select(selected_cols).head(20).to_pandas(), use_container_width=True)
-            
-            st.subheader("4. Экспорт результата")
-            if len(filtered_df) > 0:
-                export_df = filtered_df.select(selected_cols).to_pandas()
-                
-                col_exp1, col_exp2 = st.columns(2)
-                with col_exp1:
-                    csv_buf = io.StringIO()
-                    export_df.to_csv(csv_buf, sep=';', index=False, encoding='utf-8-sig')
-                    st.download_button(
-                        label="📥 Скачать CSV",
-                        data=csv_buf.getvalue().encode('utf-8-sig'),
-                        file_name="filtered_export.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-                with col_exp2:
-                    excel_buf = io.BytesIO()
-                    with pd.ExcelWriter(excel_buf, engine='openpyxl') as writer:
-                        export_df.to_excel(writer, index=False)
-                    st.download_button(
-                        label="📥 Скачать Excel",
-                        data=excel_buf.getvalue(),
-                        file_name="filtered_export.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
-        finally:
-            if temp_path.exists():
-                temp_path.unlink()
     
     # ========================================================================
     # ИНТЕРФЕЙСЫ
@@ -1549,38 +1392,22 @@ class HighVolumeAutoPartsCatalog:
         include_prices = st.checkbox("Включить цены", value=True)
         apply_markup = st.checkbox("Применить наценку", value=True, disabled=not include_prices)
         
-        # ✅ ДОБАВЛЕНО: Выбор режима экспорта
-        use_streaming = st.checkbox(
-            "⚡ Использовать потоковый экспорт (Рекомендуется для > 100 000 строк, экономит RAM)", 
-            value=True
-        )
-        
         if st.button("🚀 Экспортировать"):
             output_path = self.data_dir / f"export.{format_choice.lower()}"
             
             with st.spinner("Генерация файла..."):
-                success = False
                 if format_choice == "CSV":
-                    if use_streaming:
-                        query = self.build_export_query(selected_columns if selected_columns else None, include_prices, apply_markup)
-                        success = self.export_streaming_csv(query, str(output_path))
-                    else:
-                        success = self.export_to_csv_optimized(str(output_path), selected_columns if selected_columns else None, include_prices, apply_markup)
+                    self.export_to_csv_optimized(str(output_path), selected_columns if selected_columns else None, include_prices, apply_markup)
                 elif format_choice == "Excel":
-                    if use_streaming:
-                        query = self.build_export_query(selected_columns if selected_columns else None, include_prices, apply_markup)
-                        success = self.export_streaming_excel(query, str(output_path))
-                    else:
-                        success = self.export_to_excel_optimized(str(output_path), selected_columns if selected_columns else None, include_prices, apply_markup)
+                    self.export_to_excel_optimized(str(output_path), selected_columns if selected_columns else None, include_prices, apply_markup)
                 elif format_choice == "Parquet":
-                    success = self.export_to_parquet(str(output_path), selected_columns if selected_columns else None, include_prices, apply_markup)
+                    self.export_to_parquet(str(output_path), selected_columns if selected_columns else None, include_prices, apply_markup)
                 else:
                     st.warning("Неподдерживаемый формат")
                     return
             
-            if success:
-                with open(output_path, "rb") as f:
-                    st.download_button("⬇️ Скачать файл", f, file_name=output_path.name)
+            with open(output_path, "rb") as f:
+                st.download_button("⬇️ Скачать файл", f, file_name=output_path.name)
     
     def show_price_settings(self):
         st.header("💰 Управление ценами и наценками")
@@ -1893,36 +1720,334 @@ class HighVolumeAutoPartsCatalog:
                     st.success(f"Удалено {deleted} записей")
                     
                     st.rerun()
-
-
-# ============================================================================
-# ГЛАВНЫЙ ИНТЕРФЕЙС ПРИЛОЖЕНИЯ
-# ============================================================================
-def main():
-    st.set_page_config(page_title="Каталог Автозапчастей Pro", layout="wide", page_icon="🚗")
-    st.title("🚗 High-Volume Каталог Автозапчастей v100.22 (Power Query Edition)")
     
+    # ========================================================================
+    # НОВЫЙ ФУНКЦИОНАЛ: POWER QUERY-СТИЛЬ МЕРДЖА
+    # ========================================================================
+    def get_all_table_names(self) -> List[str]:
+        """Получить все имена таблиц из базы данных"""
+        result = self.conn.execute("SHOW TABLES").fetchall()
+        return [row[0] for row in result]
+    
+    def get_table_columns(self, table_name: str) -> List[str]:
+        """Получить имена колонок из таблицы"""
+        result = self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return [row[1] for row in result]
+    
+    def get_sample_data(self, table_name: str, limit: int = 5) -> pd.DataFrame:
+        """Получить пример данных из таблицы"""
+        return self.conn.execute(f"SELECT * FROM {table_name} LIMIT {limit}").df()
+    
+    def execute_power_query_merge(self, operations: List[Dict[str, Any]], selected_columns: List[str] = None) -> pd.DataFrame:
+        """
+        Выполнить сложный мердж нескольких таблиц с возможностью выбора колонок
+        
+        operations - список операций мерджа:
+        [
+            {
+                'table1': 'table_name1',
+                'table2': 'table_name2',
+                'columns1': ['col1', 'col2'],
+                'columns2': ['col1', 'col2'],
+                'join_type': 'inner' | 'left' | 'right' | 'outer',
+                'result_table': 'temp_table_name'
+            },
+            ...
+        ]
+        """
+        if not operations:
+            # Если нет операций, просто вернем все данные из основных таблиц
+            base_query = """
+                SELECT 
+                    p.artikul_norm, p.brand_norm, p.artikul, p.brand,
+                    p.multiplicity, p.barcode, p.length, p.width, p.height, p.weight,
+                    p.image_url, p.dimensions_str, p.description,
+                    o.name as name, o.applicability as applicability, o.category as category,
+                    c.oe_number_norm,
+                    pr.price, pr.currency
+                FROM parts p
+                LEFT JOIN oe o ON p.artikul_norm = o.oe_number_norm
+                LEFT JOIN cross_references c ON p.artikul_norm = c.artikul_norm AND p.brand_norm = c.brand_norm
+                LEFT JOIN prices pr ON p.artikul_norm = pr.artikul_norm AND p.brand_norm = c.brand_norm
+            """
+            df = self.conn.execute(base_query).df()
+            if selected_columns:
+                df = df[selected_columns]
+            return df
+        
+        # Используем временную CTE для выполнения операций
+        # Строим SQL запрос с учетом всех операций
+        initial_table = operations[0]['table1']
+        current_table = initial_table
+        current_alias = f"t{0}"
+        
+        # Начинаем строить SQL запрос
+        sql_parts = [f"WITH merged_data AS ("]
+        
+        # Первый элемент
+        sql_parts.append(f"SELECT * FROM {initial_table} AS {current_alias}")
+        
+        for i, op in enumerate(operations[1:], 1):
+            table2 = op['table2']
+            alias2 = f"t{i}"
+            
+            # Определяем условие джойна
+            join_conditions = []
+            for col1, col2 in zip(op['columns1'], op['columns2']):
+                join_conditions.append(f"{current_alias}.{col1} = {alias2}.{col2}")
+            join_condition_str = " AND ".join(join_conditions)
+            
+            # Определяем тип джойна
+            join_type = op['join_type'].upper()
+            if join_type == 'INNER':
+                join_clause = f"INNER JOIN {table2} AS {alias2} ON {join_condition_str}"
+            elif join_type == 'LEFT':
+                join_clause = f"LEFT JOIN {table2} AS {alias2} ON {join_condition_str}"
+            elif join_type == 'RIGHT':
+                join_clause = f"RIGHT JOIN {table2} AS {alias2} ON {join_condition_str}"
+            elif join_type == 'OUTER':
+                join_clause = f"FULL OUTER JOIN {table2} AS {alias2} ON {join_condition_str}"
+            else:
+                join_clause = f"LEFT JOIN {table2} AS {alias2} ON {join_condition_str}"  # по умолчанию
+            
+            sql_parts.append(f", {alias2} AS (SELECT * FROM {table2})")
+            current_alias = alias2
+        
+        # Завершаем CTE
+        sql_parts.append(")")
+        
+        # Теперь строим основной SELECT
+        # Получаем все возможные колонки из всех таблиц
+        all_tables = set()
+        for op in operations:
+            all_tables.add(op['table1'])
+            all_tables.add(op['table2'])
+        
+        # Получаем все колонки для SELECT
+        select_cols = []
+        if selected_columns:
+            # Если указаны конкретные колонки, используем их
+            for col in selected_columns:
+                select_cols.append(f"merged_data.{col} AS \"{col}\"")
+        else:
+            # Иначе используем все колонки из последней операции
+            last_op = operations[-1]
+            all_cols = set()
+            for table in all_tables:
+                cols = self.get_table_columns(table)
+                for col in cols:
+                    all_cols.add(f"merged_data.{col} AS \"{col}\"")
+            select_cols = list(all_cols)
+        
+        final_query = f"""
+        {' '.join(sql_parts)}
+        SELECT {', '.join(select_cols)}
+        FROM merged_data
+        """
+        
+        # Выполняем запрос
+        df = self.conn.execute(final_query).df()
+        return df
+
+
+def show_power_query_interface(catalog: HighVolumeAutoPartsCatalog):
+    st.header("🔗 Power Query-стиль мердж данных")
+    st.info("Настройте объединение таблиц по общим значениям")
+    
+    # Получаем список всех таблиц
+    all_tables = catalog.get_all_table_names()
+    
+    if not all_tables:
+        st.warning("Нет доступных таблиц для объединения")
+        return
+    
+    # Интерфейс для настройки операций
+    if 'merge_operations' not in st.session_state:
+        st.session_state.merge_operations = []
+    
+    st.subheader("Настройка операций объединения")
+    
+    # Добавление новой операции
+    with st.expander("➕ Добавить операцию объединения", expanded=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            table1 = st.selectbox("Первая таблица", options=all_tables, key="table1_new")
+        with col2:
+            table2 = st.selectbox("Вторая таблица", options=all_tables, key="table2_new")
+        
+        if table1 and table2:
+            cols1 = catalog.get_table_columns(table1)
+            cols2 = catalog.get_table_columns(table2)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                selected_cols1 = st.multiselect(f"Колонки из {table1}", options=cols1, key="cols1_new")
+            with col2:
+                selected_cols2 = st.multiselect(f"Колонки из {table2}", options=cols2, key="cols2_new")
+            
+            # Проверяем, что количества колонок совпадают
+            if len(selected_cols1) != len(selected_cols2):
+                st.warning("Количество выбранных колонок должно совпадать для джойна")
+            else:
+                join_type = st.selectbox("Тип объединения", options=['inner', 'left', 'right', 'outer'], key="join_type_new")
+                
+                if st.button("Добавить операцию"):
+                    if len(selected_cols1) > 0:
+                        new_operation = {
+                            'table1': table1,
+                            'table2': table2,
+                            'columns1': selected_cols1,
+                            'columns2': selected_cols2,
+                            'join_type': join_type
+                        }
+                        st.session_state.merge_operations.append(new_operation)
+                        st.success(f"Операция добавлена: {table1} + {table2}")
+                        st.rerun()
+                    else:
+                        st.error("Выберите хотя бы одну колонку из каждой таблицы")
+    
+    # Отображение текущих операций
+    if st.session_state.merge_operations:
+        st.subheader("Текущие операции объединения")
+        for i, op in enumerate(st.session_state.merge_operations):
+            with st.container():
+                st.write(f"**Операция {i+1}:** {op['table1']} ←[{op['join_type']}]→ {op['table2']}")
+                st.write(f"По колонкам: {list(zip(op['columns1'], op['columns2']))}")
+                col1, col2, col3 = st.columns([1, 1, 2])
+                with col1:
+                    if st.button(f"📋 Пример {op['table1']}", key=f"sample1_{i}"):
+                        sample = catalog.get_sample_data(op['table1'])
+                        st.dataframe(sample)
+                with col2:
+                    if st.button(f"📋 Пример {op['table2']}", key=f"sample2_{i}"):
+                        sample = catalog.get_sample_data(op['table2'])
+                        st.dataframe(sample)
+                with col3:
+                    if st.button(f"🗑️ Удалить", key=f"delete_{i}"):
+                        del st.session_state.merge_operations[i]
+                        st.rerun()
+    
+    # Выбор колонок для итогового результата
+    st.subheader("Выбор колонок для экспорта")
+    all_available_cols = set()
+    for op in st.session_state.merge_operations:
+        all_available_cols.update(catalog.get_table_columns(op['table1']))
+        all_available_cols.update(catalog.get_table_columns(op['table2']))
+    
+    selected_export_cols = st.multiselect(
+        "Выберите колонки для итогового результата", 
+        options=sorted(list(all_available_cols)),
+        default=list(all_available_cols)[:10] if all_available_cols else []
+    )
+    
+    # Кнопка выполнения объединения
+    if st.button("🔍 Выполнить объединение и получить результат"):
+        if st.session_state.merge_operations:
+            with st.spinner("Выполняется объединение данных..."):
+                try:
+                    result_df = catalog.execute_power_query_merge(
+                        st.session_state.merge_operations, 
+                        selected_export_cols if selected_export_cols else None
+                    )
+                    st.success(f"Объединение выполнено успешно! Результат содержит {len(result_df)} строк и {len(result_df.columns)} колонок.")
+                    
+                    # Показываем результат
+                    st.dataframe(result_df.head(100))  # Показываем первые 100 строк
+                    
+                    # Подготовка файлов для скачивания
+                    csv_buffer = io.StringIO()
+                    result_df.to_csv(csv_buffer, sep=';', index=False)
+                    
+                    excel_buffer = io.BytesIO()
+                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                        # Если данных больше лимита Excel, создаем несколько листов
+                        if len(result_df) > EXCEL_ROW_LIMIT:
+                            num_sheets = (len(result_df) // EXCEL_ROW_LIMIT) + 1
+                            for i in range(num_sheets):
+                                start_idx = i * EXCEL_ROW_LIMIT
+                                end_idx = min((i + 1) * EXCEL_ROW_LIMIT, len(result_df))
+                                result_df.iloc[start_idx:end_idx].to_excel(
+                                    writer, 
+                                    sheet_name=f'Результат_{i+1}', 
+                                    index=False
+                                )
+                        else:
+                            result_df.to_excel(writer, index=False)
+                    
+                    # Кнопки скачивания
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.download_button(
+                            label="⬇️ Скачать CSV",
+                            data=csv_buffer.getvalue().encode('utf-8-sig'),
+                            file_name="merged_data.csv",
+                            mime="text/csv"
+                        )
+                    with col2:
+                        st.download_button(
+                            label="⬇️ Скачать Excel",
+                            data=excel_buffer.getvalue(),
+                            file_name="merged_data.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                        
+                except Exception as e:
+                    st.error(f"Ошибка при выполнении объединения: {str(e)}")
+                    logger.exception("Ошибка в Power Query merge")
+        else:
+            st.warning("Добавьте хотя бы одну операцию объединения")
+
+
+def main():
+    st.set_page_config(
+        page_title="Каталог автозапчастей",
+        page_icon="🚗",
+        layout="wide"
+    )
+    
+    st.title("🚗 Каталог автозапчастей")
+    
+    # Инициализация каталога
     catalog = get_high_volume_catalog()
     
-    st.sidebar.header("Навигация")
+    # Боковая панель навигации
+    st.sidebar.title("Навигация")
     page = st.sidebar.radio(
         "Выберите раздел:",
         [
-            "🔧 Конструктор данных (Power Query)",
+            "Главная",
+            "📊 Статистика", 
             "📤 Экспорт данных",
-            "📈 Статистика",
+            "🔗 Power Query мердж",
             "🔧 Управление данными"
         ]
     )
     
-    if page == "🔧 Конструктор данных (Power Query)":
-        catalog.show_power_query_interface()
+    if page == "Главная":
+        st.header("Главная")
+        st.info("Добро пожаловать в систему управления каталогом автозапчастей!")
+        st.write("Используйте боковое меню для навигации по разделам.")
+        
+        # Краткая статистика
+        stats = catalog.get_statistics()
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Товаров", f"{stats.get('unique_parts', 0):,}")
+        col2.metric("Брендов", f"{stats.get('brands', 0):,}")
+        col3.metric("OE записей", f"{stats.get('oe', 0):,}")
+        col4.metric("Средняя цена", f"{stats.get('avg_price', 0):,.2f} ₽")
+    
+    elif page == "📊 Статистика":
+        catalog.show_statistics()
+    
     elif page == "📤 Экспорт данных":
         catalog.show_export_interface()
-    elif page == "📈 Статистика":
-        catalog.show_statistics()
+    
+    elif page == "🔗 Power Query мердж":
+        show_power_query_interface(catalog)
+    
     elif page == "🔧 Управление данными":
         catalog.show_data_management()
+
 
 if __name__ == "__main__":
     main()
