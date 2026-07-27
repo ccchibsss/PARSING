@@ -1,7 +1,7 @@
 # ============================================================================
 # БЛОК 11: HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ПОЛНАЯ ВЕРСИЯ v100.21 + УЛУЧШЕНИЯ)
 # ============================================================================
-# ✅ ИСПРАВЛЕНИЯ v100.21 (СОХРАНЕНЫ ПОЛНОСТЬЮ, БЕЗ СОКРАЩЕНИЙ):
+# ✅ ИСПРАВЛЕНИЯ v100.21 (СОХРАНЕНЫ ПОЛНОСТЬЮ, БЕЗ ЕДИНОГО СОКРАЩЕНИЯ):
 # 1. ИСПРАВЛЕНА ОШИБКА "table oe has 10 columns but 5 values were supplied"
 # 2. Добавлены ВСЕ колонки в oe_df (включая length, width, height, weight, dimensions_str)
 # 3. Гарантированное создание колонок с габаритами, даже если их нет в исходных данных
@@ -9,16 +9,16 @@
 # 5. ПОЛНОЕ ИСПРАВЛЕНИЕ ПРОБЛЕМЫ С ДАТАМИ В ГАБАРИТАХ
 # 6. Приоритет габаритов: данные > OE > аналоги
 # 7. Гарантированное заполнение всех 4 колонок (Длинна, Ширина, Высота, Вес)
-# 
+#
 # ✅ НОВЫЕ ВОЗМОЖНОСТИ (ДОБАВЛЕНЫ БЕЗ УДАЛЕНИЯ ОРИГИНАЛА):
 # 8. Потоковый экспорт (Streaming CSV/Excel) для экономии RAM при больших объемах
 # 9. Интерфейс "Power Query" для выбора столбцов и фильтрации перед экспортом
 # ============================================================================
 
 import streamlit as st
-import duckdb
 import polars as pl
 import pandas as pd
+import duckdb
 import json
 import os
 import re
@@ -27,16 +27,16 @@ import time
 import math
 import decimal
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, List, Optional, Any, Tuple, Callable
 from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Константы для экспорта
+# Константы
 EXCEL_ROW_LIMIT = 1_048_576
 CHUNK_SIZE = 100_000
 
@@ -889,7 +889,7 @@ class HighVolumeAutoPartsCatalog:
         progress_bar.progress(1.0, text="Обновление базы данных завершено!")
         time.sleep(1)
         progress_bar.empty()
-    
+
     # ========================================================================
     # ✅ НОВЫЕ МЕТОДЫ: ПОТОКОВЫЙ ЭКСПОРТ (v100.22)
     # ========================================================================
@@ -952,97 +952,6 @@ class HighVolumeAutoPartsCatalog:
             logger.error(f"Excel Export Error: {e}")
             st.error(f"Ошибка экспорта Excel: {e}")
             return False
-
-    # ========================================================================
-    # ✅ НОВЫЙ ИНТЕРФЕЙС: POWER QUERY КОНСТРУКТОР (v100.22)
-    # ========================================================================
-    def show_power_query_interface(self):
-        st.header("🔧 Конструктор данных (Power Query)")
-        st.info("Загрузите файл, выберите нужные столбцы и примените фильтры перед экспортом.")
-        
-        uploaded_file = st.file_uploader("Загрузите файл Excel или CSV", type=['xlsx', 'xls', 'csv'], key="pq_upload")
-        if not uploaded_file:
-            return
-            
-        temp_path = self.data_dir / f"temp_pq_{uploaded_file.name}"
-        temp_path.write_bytes(uploaded_file.getvalue())
-        
-        try:
-            file_type = 'universal'
-            df = self.read_and_prepare_file(str(temp_path), file_type)
-            
-            if df.is_empty():
-                st.warning("Не удалось прочитать файл или он пуст.")
-                return
-                
-            st.success(f"Файл успешно прочитан! Найдено {len(df)} строк и {len(df.columns)} колонок.")
-            
-            st.subheader("1. Выбор столбцов для экспорта")
-            all_cols = df.columns
-            display_cols = [c for c in all_cols if not c.endswith('_norm')]
-            selected_cols = st.multiselect("Выберите столбцы:", display_cols, default=display_cols)
-            
-            st.subheader("2. Фильтрация данных (необязательно)")
-            add_filter = st.checkbox("Добавить фильтр")
-            filtered_df = df
-            
-            if add_filter and selected_cols:
-                col1, col2, col3 = st.columns([3, 2, 3])
-                with col1:
-                    filter_col = st.selectbox("Столбец", selected_cols)
-                with col2:
-                    filter_op = st.selectbox("Оператор", ["==", "!=", ">", "<", "contains"])
-                with col3:
-                    filter_val = st.text_input("Значение")
-                
-                if st.button("Применить фильтр"):
-                    try:
-                        if filter_op == "==":
-                            filtered_df = df.filter(pl.col(filter_col) == filter_val)
-                        elif filter_op == "!=":
-                            filtered_df = df.filter(pl.col(filter_col) != filter_val)
-                        elif filter_op == ">":
-                            filtered_df = df.filter(pl.col(filter_col) > float(filter_val))
-                        elif filter_op == "<":
-                            filtered_df = df.filter(pl.col(filter_col) < float(filter_val))
-                        elif filter_op == "contains":
-                            filtered_df = df.filter(pl.col(filter_col).str.contains(filter_val, literal=True))
-                        st.success(f"Фильтр применен. Осталось строк: {len(filtered_df)}")
-                    except Exception as e:
-                        st.error(f"Ошибка фильтрации: {e}")
-            
-            st.subheader("3. Предпросмотр результата")
-            st.dataframe(filtered_df.select(selected_cols).head(20).to_pandas(), use_container_width=True)
-            
-            st.subheader("4. Экспорт результата")
-            if len(filtered_df) > 0:
-                export_df = filtered_df.select(selected_cols).to_pandas()
-                
-                col_exp1, col_exp2 = st.columns(2)
-                with col_exp1:
-                    csv_buf = io.StringIO()
-                    export_df.to_csv(csv_buf, sep=';', index=False, encoding='utf-8-sig')
-                    st.download_button(
-                        label="📥 Скачать CSV",
-                        data=csv_buf.getvalue().encode('utf-8-sig'),
-                        file_name="filtered_export.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-                with col_exp2:
-                    excel_buf = io.BytesIO()
-                    with pd.ExcelWriter(excel_buf, engine='openpyxl') as writer:
-                        export_df.to_excel(writer, index=False)
-                    st.download_button(
-                        label="📥 Скачать Excel",
-                        data=excel_buf.getvalue(),
-                        file_name="filtered_export.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
-        finally:
-            if temp_path.exists():
-                temp_path.unlink()
 
     # ========================================================================
     # ЭКСПОРТ (✅ v100.20 - ГАРАНТИРОВАННОЕ ЗАПОЛНЕНИЕ ГАБАРИТОВ)
@@ -1523,6 +1432,97 @@ class HighVolumeAutoPartsCatalog:
             logger.error(f"Ошибка сбора статистики: {e}")
         
         return stats
+
+    # ========================================================================
+    # ✅ НОВЫЙ ИНТЕРФЕЙС: POWER QUERY КОНСТРУКТОР (v100.22)
+    # ========================================================================
+    def show_power_query_interface(self):
+        st.header("🔧 Конструктор данных (Power Query)")
+        st.info("Загрузите файл, выберите нужные столбцы и примените фильтры перед экспортом.")
+        
+        uploaded_file = st.file_uploader("Загрузите файл Excel или CSV", type=['xlsx', 'xls', 'csv'], key="pq_upload")
+        if not uploaded_file:
+            return
+            
+        temp_path = self.data_dir / f"temp_pq_{uploaded_file.name}"
+        temp_path.write_bytes(uploaded_file.getvalue())
+        
+        try:
+            file_type = 'universal'
+            df = self.read_and_prepare_file(str(temp_path), file_type)
+            
+            if df.is_empty():
+                st.warning("Не удалось прочитать файл или он пуст.")
+                return
+                
+            st.success(f"Файл успешно прочитан! Найдено {len(df)} строк и {len(df.columns)} колонок.")
+            
+            st.subheader("1. Выбор столбцов для экспорта")
+            all_cols = df.columns
+            display_cols = [c for c in all_cols if not c.endswith('_norm')]
+            selected_cols = st.multiselect("Выберите столбцы:", display_cols, default=display_cols)
+            
+            st.subheader("2. Фильтрация данных (необязательно)")
+            add_filter = st.checkbox("Добавить фильтр")
+            filtered_df = df
+            
+            if add_filter and selected_cols:
+                col1, col2, col3 = st.columns([3, 2, 3])
+                with col1:
+                    filter_col = st.selectbox("Столбец", selected_cols)
+                with col2:
+                    filter_op = st.selectbox("Оператор", ["==", "!=", ">", "<", "contains"])
+                with col3:
+                    filter_val = st.text_input("Значение")
+                
+                if st.button("Применить фильтр"):
+                    try:
+                        if filter_op == "==":
+                            filtered_df = df.filter(pl.col(filter_col) == filter_val)
+                        elif filter_op == "!=":
+                            filtered_df = df.filter(pl.col(filter_col) != filter_val)
+                        elif filter_op == ">":
+                            filtered_df = df.filter(pl.col(filter_col) > float(filter_val))
+                        elif filter_op == "<":
+                            filtered_df = df.filter(pl.col(filter_col) < float(filter_val))
+                        elif filter_op == "contains":
+                            filtered_df = df.filter(pl.col(filter_col).str.contains(filter_val, literal=True))
+                        st.success(f"Фильтр применен. Осталось строк: {len(filtered_df)}")
+                    except Exception as e:
+                        st.error(f"Ошибка фильтрации: {e}")
+            
+            st.subheader("3. Предпросмотр результата")
+            st.dataframe(filtered_df.select(selected_cols).head(20).to_pandas(), use_container_width=True)
+            
+            st.subheader("4. Экспорт результата")
+            if len(filtered_df) > 0:
+                export_df = filtered_df.select(selected_cols).to_pandas()
+                
+                col_exp1, col_exp2 = st.columns(2)
+                with col_exp1:
+                    csv_buf = io.StringIO()
+                    export_df.to_csv(csv_buf, sep=';', index=False, encoding='utf-8-sig')
+                    st.download_button(
+                        label="📥 Скачать CSV",
+                        data=csv_buf.getvalue().encode('utf-8-sig'),
+                        file_name="filtered_export.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                with col_exp2:
+                    excel_buf = io.BytesIO()
+                    with pd.ExcelWriter(excel_buf, engine='openpyxl') as writer:
+                        export_df.to_excel(writer, index=False)
+                    st.download_button(
+                        label="📥 Скачать Excel",
+                        data=excel_buf.getvalue(),
+                        file_name="filtered_export.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
     
     # ========================================================================
     # ИНТЕРФЕЙСЫ
@@ -1896,7 +1896,7 @@ class HighVolumeAutoPartsCatalog:
 
 
 # ============================================================================
-# ГЛАВНОЕ ПРИЛОЖЕНИЕ STREAMLIT
+# ГЛАВНЫЙ ИНТЕРФЕЙС ПРИЛОЖЕНИЯ
 # ============================================================================
 def main():
     st.set_page_config(page_title="Каталог Автозапчастей Pro", layout="wide", page_icon="🚗")
