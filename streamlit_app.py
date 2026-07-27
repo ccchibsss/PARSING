@@ -83,7 +83,7 @@ class HighVolumeAutoPartsCatalog:
         self.category_mapping = self.load_category_mapping()
         
         self.db_path = self.data_dir / "catalog.duckdb"
-        self.conn = duckdb.connect(database=str(self.db_path), check_same_thread=False)
+        self.conn = duckdb.connect(database=str(self.db_path))
         self.setup_database()
     
     # ========================================================================
