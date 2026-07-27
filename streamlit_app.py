@@ -1,4 +1,4 @@
-# app.py (ЧАСТЬ 1 из 2)
+# app.py (ПОЛНАЯ ИСПРАВЛЕННАЯ ВЕРСИЯ)
 import os
 import sys
 import json
@@ -18,7 +18,7 @@ import polars as pl
 import pandas as pd
 
 # ============================================================================
-# НАСТРОЙКА ЛОГИРОВАНИЯ (тихая запись в файл)
+# НАСТРОЙКА ЛОГИРОВАНИЯ (Исправлено: добавлен вывод в консоль)
 # ============================================================================
 log_dir = Path("./auto_parts_data")
 log_dir.mkdir(exist_ok=True)
@@ -27,6 +27,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(log_dir / "app.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout) # ДОБАВЛЕНО: Вывод в консоль Streamlit
     ]
 )
 logger = logging.getLogger(__name__)
@@ -499,26 +500,34 @@ class HighVolumeAutoPartsCatalog:
             if col in df.columns:
                 df = df.with_columns(self.clean_values(pl.col(col)).alias(col))
         
+        # ====================================================================
+        # ✅ ИСПРАВЛЕННЫЙ БЛОК КОНВЕРТАЦИИ ЧИСЕЛ (через Polars, без ручных циклов)
+        # ====================================================================
         numeric_cols = ['length', 'width', 'height', 'weight', 'price']
         for col in numeric_cols:
             if col in df.columns:
                 try:
-                    converted_values = []
-                    for val in df[col].to_list():
-                        converted = self.safe_convert_to_float(val)
-                        converted_values.append(converted)
-                    
-                    df = df.with_columns(pl.Series(converted_values).alias(col))
-                    df = df.with_columns(pl.col(col).round(2).alias(col))
-                    
-                    logger.info(f"✅ Колонка '{col}' сконвертирована в числа")
-                    
+                    # Используем встроенные методы Polars для чистки и конвертации
+                    # Это намного надежнее и быстрее, чем перебор Python-списков
+                    df = df.with_columns(
+                        pl.col(col)
+                        .cast(pl.Utf8)                                      # В строку
+                        .str.replace_all(r'[^\d.,\-]', '')                   # Удаляем все символы кроме цифр, точек, запятых и минуса
+                        .str.replace(',', '.')                              # Заменяем запятую на точку
+                        .str.replace(r'\.(?=.*\.)', '')                     # Оставляем только последнюю точку (убираем лишние)
+                        .cast(pl.Float64, strict=False)                     # Конвертируем в число. Если не получается - будет null
+                        .fill_null(0.0)                                     # Null превращаем в 0.0
+                        .round(2)
+                        .alias(col)
+                    )
+                    logger.info(f"✅ Колонка '{col}' сконвертирована в числа через Polars")
                 except Exception as e:
                     logger.warning(f"Не удалось преобразовать {col}: {e}")
                     try:
                         df = df.with_columns(pl.lit(0.0).cast(pl.Float64).alias(col))
                     except Exception:
                         pass
+        # ====================================================================
         
         key_cols = [col for col in ['oe_number', 'artikul', 'brand'] if col in df.columns]
         if key_cols:
@@ -552,9 +561,18 @@ class HighVolumeAutoPartsCatalog:
                 with open(temp_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
                 
-                df = self.read_and_prepare_file(str(temp_path), file_type)
-                if not df.is_empty():
-                    dfs_for_type.append(df)
+                # ====================================================================
+                # ✅ ИСПРАВЛЕНИЕ: Обработка с выводом точной ошибки в интерфейс
+                # ====================================================================
+                try:
+                    df = self.read_and_prepare_file(str(temp_path), file_type)
+                    if not df.is_empty():
+                        dfs_for_type.append(df)
+                except Exception as e:
+                    # Выводим ошибку прямо на экран, чтобы пользователь видел
+                    st.error(f"❌ Ошибка при обработке файла '{uploaded_file.name}': {str(e)}")
+                    logger.exception(f"Ошибка обработки файла {uploaded_file.name}")
+                # ====================================================================
                 
                 try:
                     temp_path.unlink()
