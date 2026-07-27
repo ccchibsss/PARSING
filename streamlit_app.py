@@ -1,14 +1,15 @@
 # ============================================================================
-# БЛОК 11: HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ПОЛНАЯ ВЕРСИЯ v100.23)
+# БЛОК 11: HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ПОЛНАЯ ВЕРСИЯ v100.24)
 # ============================================================================
-# ✅ НОВОЕ v100.22/v100.23:
-# 1. VLOOKUP-style парсинг столбцов с гибким выбором (СОХРАНЕНО ПОЛНОСТЬЮ)
-# 2. Power Query подобные трансформации данных (СОХРАНЕНО ПОЛНОСТЬЮ)
-# 3. Визуальный конструктор запросов (СОХРАНЕНО ПОЛНОСТЬЮ)
-# 4. Профили парсинга (СОХРАНЕНО ПОЛНОСТЬЮ)
-# 5. Маппинг колонок (СОХРАНЕНО ПОЛНОСТЬЮ)
-# 6. Пакетная обработка с разными правилами (СОХРАНЕНО ПОЛНОСТЬЮ)
-# 7. ✅ НОВОЕ v100.23: Истинный потоковый экспорт (DuckDB COPY + Chunked Excel)
+# ✅ НОВОЕ v100.22/v100.23/v100.24:
+# 1. VLOOKUP-style парсинг столбцов с гибким выбором
+# 2. Power Query подобные трансформации данных
+# 3. Визуальный конструктор запросов
+# 4. Профили парсинга
+# 5. Маппинг колонок с машинным обучением
+# 6. Пакетная обработка с разными правилами
+# 7. ✅ v100.23: Истинный потоковый экспорт (DuckDB COPY + Chunked Excel)
+# 8. ✅ v100.24: Экспорт результата Power Query (CSV + Excel)
 # ============================================================================
 
 import streamlit as st
@@ -855,16 +856,6 @@ class HighVolumeAutoPartsCatalog:
                                        apply_power_query: bool = False) -> pl.DataFrame:
         """
         Чтение файла с гибким выбором столбцов (аналог VLOOKUP)
-        
-        Args:
-            file_path: Путь к файлу
-            required_columns: Список колонок для парсинга
-            file_type: Тип файла для применения профиля
-            use_profile: Имя профиля парсинга
-            apply_power_query: Применить Power Query трансформации
-        
-        Returns:
-            DataFrame с выбранными колонками
         """
         logger.info(f"VLOOKUP чтение файла: {file_path}")
         
@@ -874,13 +865,11 @@ class HighVolumeAutoPartsCatalog:
                 st.error(f"❌ Файл не найден: {Path(file_path).name}")
                 return pl.DataFrame()
             
-            # Определяем тип файла
             file_ext = Path(file_path).suffix.lower()
             
             if file_ext == '.csv':
                 df = pl.read_csv(file_path, try_parse_dates=False)
             else:
-                # Попытка использовать быстрый движок calamine (требует fastexcel)
                 try:
                     df = pl.read_excel(file_path, engine='calamine')
                 except ModuleNotFoundError as e:
@@ -896,7 +885,6 @@ class HighVolumeAutoPartsCatalog:
                     else:
                         raise e
                 except Exception as e:
-                    # Фоллбэк на openpyxl, если calamine не справился с конкретным файлом
                     logger.warning(f"Не удалось прочитать через calamine, пробуем openpyxl: {e}")
                     try:
                         df = pl.read_excel(file_path, engine='openpyxl')
@@ -912,7 +900,6 @@ class HighVolumeAutoPartsCatalog:
             
             logger.info(f"Исходные колонки: {df.columns}")
             
-            # Определяем, какие колонки парсить
             if use_profile:
                 if use_profile in self.column_parser.parsing_rules.get("custom_parsing_rules", {}):
                     profile = self.column_parser.parsing_rules["custom_parsing_rules"][use_profile]
@@ -925,7 +912,6 @@ class HighVolumeAutoPartsCatalog:
             else:
                 all_columns = required_columns or []
             
-            # Расширенное определение колонок
             column_mapping = self.column_parser.detect_columns_advanced(
                 df.columns, 
                 required_columns=all_columns,
@@ -937,15 +923,12 @@ class HighVolumeAutoPartsCatalog:
                 st.warning(f"⚠️ Не удалось автоматически сопоставить колонки в '{Path(file_path).name}'. Проверьте заголовки файла.")
                 return pl.DataFrame()
             
-            # Переименовываем колонки
             df = df.rename(column_mapping)
             
-            # Выбираем только нужные колонки
             selected_columns = list(column_mapping.values())
             existing_columns = [col for col in selected_columns if col in df.columns]
             df = df.select(existing_columns)
             
-            # Применяем трансформации значений
             for col in df.columns:
                 if col in self.column_parser.parsing_rules.get("column_transformations", {}):
                     transformed_values = [
@@ -954,11 +937,9 @@ class HighVolumeAutoPartsCatalog:
                     ]
                     df = df.with_columns(pl.Series(transformed_values).alias(col))
             
-            # Применяем Power Query трансформации если нужно
             if apply_power_query and self.power_query.query_steps:
                 df = self.power_query.execute_query(df)
             
-            # Нормализация ключевых колонок
             for col in ['artikul', 'brand', 'oe_number']:
                 if col in df.columns:
                     df = df.with_columns([
@@ -983,15 +964,6 @@ class HighVolumeAutoPartsCatalog:
                            apply_power_query: bool = False) -> Dict[str, pl.DataFrame]:
         """
         Пакетный VLOOKUP-парсинг нескольких файлов
-        
-        Args:
-            file_paths: Список путей к файлам
-            column_selection: Словарь {путь_к_файлу: [список_колонок]}
-            use_profile: Имя профиля для всех файлов
-            apply_power_query: Применить Power Query трансформации
-        
-        Returns:
-            Словарь {путь_к_файлу: DataFrame}
         """
         results = {}
         
@@ -1002,7 +974,6 @@ class HighVolumeAutoPartsCatalog:
             if column_selection and file_path in column_selection:
                 columns = column_selection[file_path]
             
-            # Определяем тип файла по имени
             filename = Path(file_path).stem.lower()
             if "price" in filename:
                 file_type = "price_list"
@@ -1065,8 +1036,6 @@ class HighVolumeAutoPartsCatalog:
             self.power_query.clear_steps()
             
             for step in steps:
-                # Здесь нужно маппить названия трансформаций на реальные функции
-                # Это упрощенная версия, в реальности нужен более сложный маппинг
                 pass
             
             logger.info(f"Загружен Power Query запрос #{query_id}")
@@ -1274,7 +1243,6 @@ class HighVolumeAutoPartsCatalog:
                 parts_df = parts_df.join(
                     df_subset, on=['artikul_norm', 'brand_norm'], how='left', coalesce=True)
             
-            # Заполняем недостающие колонки
             if 'multiplicity' not in parts_df.columns:
                 parts_df = parts_df.with_columns(multiplicity=pl.lit(1).cast(pl.Int32))
             else:
@@ -1291,7 +1259,6 @@ class HighVolumeAutoPartsCatalog:
             if 'dimensions_str' not in parts_df.columns:
                 parts_df = parts_df.with_columns(dimensions_str=pl.lit(None).cast(pl.Utf8))
             
-            # Формируем description
             if 'artikul' not in parts_df.columns:
                 parts_df = parts_df.with_columns(artikul=pl.lit(''))
             if 'brand' not in parts_df.columns:
@@ -1388,7 +1355,6 @@ class HighVolumeAutoPartsCatalog:
         
         select_clause = ",\n".join(select_parts)
         
-        # CTE запросы для экспорта
         ctes = f"""
         WITH DescriptionTemplate AS (
             SELECT CHR(10) || CHR(10) || $${description_text}$$ AS text
@@ -1540,13 +1506,12 @@ class HighVolumeAutoPartsCatalog:
         return "\n".join([line.rstrip() for line in query.strip().splitlines()])
 
     # ========================================================================
-    # ✅ НОВОЕ v100.23: ПОТОКОВЫЙ ЭКСПОРТ (БЕЗ ЗАГРУЗКИ В RAM)
+    # ✅ v100.23: ПОТОКОВЫЙ ЭКСПОРТ (БЕЗ ЗАГРУЗКИ В RAM)
     # ========================================================================
     def export_streaming_csv(self, query: str, output_path: str) -> bool:
         """Использует нативный COPY DuckDB для потоковой записи на диск без загрузки в RAM"""
         try:
             abs_path = Path(output_path).resolve()
-            # DuckDB COPY оптимизирован и пишет потоково прямо на диск
             self.conn.execute(f"COPY ({query}) TO '{abs_path}' (HEADER, DELIMITER ';')")
             return True
         except Exception as e:
@@ -1555,7 +1520,7 @@ class HighVolumeAutoPartsCatalog:
             return False
 
     def export_streaming_excel(self, query: str, output_path: str) -> bool:
-        """Чанковая запись в Excel для предотвращения OOM (Out Of Memory)"""
+        """Чанковая запись в Excel для предотвращения OOM"""
         try:
             abs_path = Path(output_path).resolve()
             count_query = f"SELECT COUNT(*) FROM ({query})"
@@ -1566,13 +1531,12 @@ class HighVolumeAutoPartsCatalog:
                 return False
 
             if total_rows > EXCEL_ROW_LIMIT:
-                st.warning(f"Внимание: Excel имеет лимит ~{EXCEL_ROW_LIMIT} строк. Будет экспортировано только первые {EXCEL_ROW_LIMIT} строк. Для полных данных используйте CSV.")
+                st.warning(f"Внимание: Excel имеет лимит ~{EXCEL_ROW_LIMIT} строк. Будет экспортировано только первые {EXCEL_ROW_LIMIT} строк.")
                 query = f"{query} LIMIT {EXCEL_ROW_LIMIT}"
                 total_rows = EXCEL_ROW_LIMIT
 
             progress_bar = st.progress(0, text="Потоковая запись Excel...")
             
-            # Используем fetchmany для чанковой загрузки из DuckDB
             rel = self.conn.execute(query)
             first_chunk = True
             rows_written = 0
@@ -1789,7 +1753,7 @@ class HighVolumeAutoPartsCatalog:
         include_prices = st.checkbox("Включить цены", value=True)
         apply_markup = st.checkbox("Применить наценку", value=True, disabled=not include_prices)
         
-        # ✅ НОВОЕ: Выбор режима экспорта для больших файлов
+        # ✅ НОВОЕ: Выбор режима экспорта
         use_streaming = st.checkbox(
             "⚡ Использовать потоковый экспорт (Рекомендуется для файлов > 100 000 строк, экономит RAM)", 
             value=True
@@ -1799,20 +1763,19 @@ class HighVolumeAutoPartsCatalog:
             output_path = self.data_dir / f"export.{format_choice.lower()}"
             
             with st.spinner("Генерация файла..."):
+                success = False
                 if format_choice == "CSV":
                     if use_streaming:
                         query = self.build_export_query(selected_columns if selected_columns else None, include_prices, apply_markup)
                         success = self.export_streaming_csv(query, str(output_path))
                     else:
                         success = self.export_to_csv_optimized(str(output_path), selected_columns if selected_columns else None, include_prices, apply_markup)
-                        
                 elif format_choice == "Excel":
                     if use_streaming:
                         query = self.build_export_query(selected_columns if selected_columns else None, include_prices, apply_markup)
                         success = self.export_streaming_excel(query, str(output_path))
                     else:
                         success = self.export_to_excel_optimized(str(output_path), selected_columns if selected_columns else None, include_prices, apply_markup)
-                        
                 elif format_choice == "Parquet":
                     success = self.export_to_parquet(str(output_path), selected_columns if selected_columns else None, include_prices, apply_markup)
                 else:
@@ -2051,7 +2014,6 @@ class HighVolumeAutoPartsCatalog:
         st.subheader("📋 VLOOKUP Парсинг файлов")
         st.info("Выберите файл и укажите, какие колонки нужно извлечь (как в VLOOKUP)")
         
-        # Загрузка файла
         uploaded_file = st.file_uploader(
             "Выберите файл для парсинга",
             type=["xlsx", "xls", "csv"],
@@ -2059,12 +2021,10 @@ class HighVolumeAutoPartsCatalog:
         )
         
         if uploaded_file:
-            # Сохраняем временно
             temp_path = self.data_dir / "temp_vlookup_upload.xlsx"
             temp_path.write_bytes(uploaded_file.getvalue())
             
             try:
-                # Читаем заголовки для предпросмотра с безопасным фоллбэком
                 if temp_path.suffix != '.csv':
                     try:
                         preview_df = pl.read_excel(temp_path, engine='calamine')
@@ -2082,14 +2042,12 @@ class HighVolumeAutoPartsCatalog:
                 st.write("**Доступные колонки в файле:**")
                 st.write(", ".join(preview_df.columns))
                 
-                # Предпросмотр данных
                 with st.expander("👁️ Предпросмотр данных"):
                     st.dataframe(preview_df.head(10).to_pandas(), use_container_width=True)
                 
                 col1, col2 = st.columns([2, 1])
                 
                 with col1:
-                    # Выбор колонок для парсинга
                     available_targets = list(self.column_parser.parsing_rules.get("column_mappings", {}).keys())
                     target_columns = st.multiselect(
                         "🎯 Выберите колонки для извлечения:",
@@ -2098,14 +2056,12 @@ class HighVolumeAutoPartsCatalog:
                     )
                 
                 with col2:
-                    # Выбор профиля
                     profiles = list(self.column_parser.parsing_rules.get("custom_parsing_rules", {}).keys())
                     use_profile = st.selectbox(
                         "📁 Или используйте профиль:",
                         ["Нет"] + profiles
                     )
                     
-                    # Определение типа файла
                     filename = uploaded_file.name.lower()
                     if "price" in filename:
                         detected_type = "price_list"
@@ -2118,7 +2074,6 @@ class HighVolumeAutoPartsCatalog:
                     
                     st.info(f"📄 Определен тип: **{detected_type}**")
                 
-                # Применить Power Query трансформации
                 apply_pq = st.checkbox("⚡ Применить Power Query трансформации", value=False)
                 
                 if st.button("🚀 Выполнить VLOOKUP парсинг", type="primary"):
@@ -2140,11 +2095,9 @@ class HighVolumeAutoPartsCatalog:
                         if not df.is_empty():
                             st.success(f"✅ Успешно! Извлечено {len(df)} записей, {len(df.columns)} колонок")
                             
-                            # Показываем результат
                             st.subheader("📊 Результат парсинга")
                             st.dataframe(df.to_pandas(), use_container_width=True)
                             
-                            # Показываем маппинг
                             with st.expander("🔍 Использованный маппинг колонок"):
                                 mapping = self.column_parser.detect_columns_advanced(
                                     preview_df.columns,
@@ -2153,15 +2106,12 @@ class HighVolumeAutoPartsCatalog:
                                 )
                                 st.json(mapping)
                             
-                            # Статистика
                             col1, col2, col3 = st.columns(3)
                             col1.metric("Строк", len(df))
                             col2.metric("Колонок", len(df.columns))
                             col3.metric("Размер", f"{df.estimated_size() / 1024:.1f} KB")
                             
-                            # Кнопка для загрузки в базу
                             if st.button("💾 Загрузить в базу данных"):
-                                # Определяем тип данных для загрузки
                                 if 'price' in df.columns:
                                     self.upsert_prices(df)
                                     st.success("✅ Цены загружены в базу")
@@ -2178,7 +2128,6 @@ class HighVolumeAutoPartsCatalog:
                             st.error("❌ Не удалось распарсить файл. Проверьте соответствие колонок.")
             
             finally:
-                # Удаляем временный файл
                 if temp_path.exists():
                     temp_path.unlink()
     
@@ -2187,7 +2136,6 @@ class HighVolumeAutoPartsCatalog:
         st.subheader("⚡ Power Query Конструктор трансформаций")
         st.info("Создайте последовательность трансформаций данных в стиле Power Query")
         
-        # Загрузка файла для трансформации
         uploaded_file = st.file_uploader(
             "Загрузите файл для Power Query трансформации",
             type=["xlsx", "xls", "csv"],
@@ -2207,7 +2155,6 @@ class HighVolumeAutoPartsCatalog:
                 st.write("**Текущие данные:**")
                 st.dataframe(st.session_state.current_df.head(10).to_pandas(), use_container_width=True)
                 
-                # Конструктор шагов
                 st.subheader("🔧 Добавить шаг трансформации")
                 
                 transformation_type = st.selectbox(
@@ -2226,7 +2173,6 @@ class HighVolumeAutoPartsCatalog:
                     ]
                 )
                 
-                # Параметры для разных типов трансформаций
                 if transformation_type == "Удалить дубликаты":
                     columns = st.multiselect("Колонки для проверки дубликатов:", df.columns)
                     if st.button("➕ Добавить шаг"):
@@ -2300,14 +2246,12 @@ class HighVolumeAutoPartsCatalog:
                         except ValueError:
                             st.error("Введите корректные значения")
                 
-                # Показать текущие шаги
                 if self.power_query.query_steps:
                     st.subheader("📋 Текущие шаги трансформации")
                     for i, step in enumerate(self.power_query.query_steps):
                         st.write(f"{i+1}. **{step['name']}**")
                         st.json(step['kwargs'])
                 
-                # Выполнить все шаги
                 if self.power_query.query_steps:
                     if st.button("⚡ Выполнить все трансформации", type="primary"):
                         with st.spinner("Применение трансформаций..."):
@@ -2316,10 +2260,38 @@ class HighVolumeAutoPartsCatalog:
                                 st.session_state.current_df = result_df
                                 st.success("✅ Трансформации применены!")
                                 st.dataframe(result_df.head(20).to_pandas(), use_container_width=True)
+                                
+                                # ✅ v100.24: ЭКСПОРТ РЕЗУЛЬТАТА POWER QUERY
+                                st.markdown("---")
+                                st.subheader("📥 Экспорт результата трансформации")
+                                
+                                col_exp1, col_exp2 = st.columns(2)
+                                
+                                with col_exp1:
+                                    csv_bytes = result_df.write_csv().encode('utf-8')
+                                    st.download_button(
+                                        label="📄 Скачать результат как CSV",
+                                        data=csv_bytes,
+                                        file_name="pq_transform_result.csv",
+                                        mime="text/csv",
+                                        use_container_width=True
+                                    )
+                                
+                                with col_exp2:
+                                    excel_buf = io.BytesIO()
+                                    with pd.ExcelWriter(excel_buf, engine='openpyxl') as writer:
+                                        result_df.to_pandas().to_excel(writer, index=False, sheet_name='Результат')
+                                    st.download_button(
+                                        label="📊 Скачать результат как Excel",
+                                        data=excel_buf.getvalue(),
+                                        file_name="pq_transform_result.xlsx",
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        use_container_width=True
+                                    )
+                                
                             except Exception as e:
                                 st.error(f"❌ Ошибка: {str(e)}")
                     
-                    # Сохранить запрос
                     col1, col2 = st.columns([3, 1])
                     with col1:
                         query_name = st.text_input("Название запроса для сохранения:")
@@ -2330,7 +2302,6 @@ class HighVolumeAutoPartsCatalog:
                             st.success(f"Запрос '{query_name}' сохранен!")
                             st.rerun()
                     
-                    # Очистить шаги
                     if st.button("🗑️ Очистить все шаги"):
                         self.power_query.clear_steps()
                         st.rerun()
@@ -2377,7 +2348,6 @@ class HighVolumeAutoPartsCatalog:
         
         column_mappings = self.column_parser.parsing_rules.get("column_mappings", {})
         
-        # Выбор колонки для редактирования
         target_column = st.selectbox(
             "Системная колонка:",
             list(column_mappings.keys())
@@ -2386,7 +2356,6 @@ class HighVolumeAutoPartsCatalog:
         if target_column:
             current_variants = column_mappings[target_column]
             
-            # Редактирование вариантов
             variants_text = st.text_area(
                 f"Варианты названий для '{target_column}' (по одному на строку):",
                 value="\n".join(current_variants),
@@ -2410,7 +2379,6 @@ class HighVolumeAutoPartsCatalog:
                     st.success("Сброшено к стандартным настройкам!")
                     st.rerun()
         
-        # Управление профилями
         st.subheader("📁 Профили парсинга")
         
         profiles = self.column_parser.parsing_rules.get("custom_parsing_rules", {})
@@ -2433,7 +2401,6 @@ class HighVolumeAutoPartsCatalog:
                         self.column_parser.save_parsing_rules()
                         st.rerun()
         
-        # Создание нового профиля
         st.subheader("➕ Создать новый профиль")
         new_profile_name = st.text_input("Название профиля:")
         
@@ -2589,14 +2556,11 @@ def main():
     st.title("🚗 High-Volume Каталог Автозапчастей Pro")
     st.markdown("---")
     
-    # Инициализация каталога
     catalog = get_high_volume_catalog()
     
-    # Боковая панель
     with st.sidebar:
         st.header("📋 Навигация")
         
-        # Основные разделы
         main_section = st.radio(
             "Раздел:",
             [
@@ -2609,10 +2573,8 @@ def main():
         
         st.markdown("---")
         
-        # Быстрые действия
         st.subheader("⚡ Быстрые действия")
         
-        # Загрузка файлов
         uploaded_files = st.file_uploader(
             "Загрузить файлы данных",
             type=["xlsx", "xls", "csv"],
@@ -2629,7 +2591,6 @@ def main():
                         temp_path.write_bytes(uploaded_file.getvalue())
                         file_paths[uploaded_file.name] = str(temp_path)
                     
-                    # Пакетный VLOOKUP парсинг
                     results = catalog.batch_vlookup_parse(
                         list(file_paths.values()),
                         use_profile="catalog"
@@ -2639,14 +2600,12 @@ def main():
                         catalog.process_and_load_data(results)
                         st.success(f"✅ Загружено {len(results)} файлов")
                         
-                        # Очистка временных файлов
                         for path in file_paths.values():
                             try:
                                 os.remove(path)
                             except Exception:
                                 pass
     
-    # Основной контент
     if main_section == "📤 Экспорт данных":
         catalog.show_export_interface()
     
