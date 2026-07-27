@@ -2006,6 +2006,8 @@ def show_power_query_interface(catalog: HighVolumeAutoPartsCatalog):
                     logger.exception("Ошибка в Power Query merge")
         else:
             st.warning("Добавьте хотя бы одну операцию объединения")
+
+
 def main():
     st.set_page_config(
         page_title="Каталог автозапчастей",
