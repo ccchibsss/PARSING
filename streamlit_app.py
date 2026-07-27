@@ -2144,3 +2144,425 @@ def main():
 
 if __name__ == "__main__":
     main()
+# app.py (продолжение)
+
+# ========================================================================
+# ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ПРИЛОЖЕНИЯ
+# ========================================================================
+
+class AdvancedDataProcessor:
+    """
+    Класс для расширенной обработки данных
+    """
+    def __init__(self, catalog: HighVolumeAutoPartsCatalog):
+        self.catalog = catalog
+    
+    def get_advanced_column_mapping(self) -> Dict[str, List[str]]:
+        """
+        Получить расширенные сопоставления столбцов с учетом семантики
+        """
+        semantic_mappings = {
+            'identifiers': ['oe_number', 'artikul', 'barcode', 'oe_number_norm', 'artikul_norm'],
+            'descriptive': ['name', 'description', 'applicability', 'category'],
+            'dimensional': ['length', 'width', 'height', 'weight', 'dimensions_str'],
+            'commercial': ['price', 'currency', 'multiplicity'],
+            'media': ['image_url']
+        }
+        
+        all_columns = self.catalog.get_all_table_columns()
+        enhanced_mapping = {}
+        
+        for category, keywords in semantic_mappings.items():
+            matched_cols = []
+            for table, cols in all_columns.items():
+                for col in cols:
+                    if any(keyword in col.lower() for keyword in keywords):
+                        matched_cols.append(f"{table}.{col}")
+            enhanced_mapping[category] = matched_cols
+        
+        return enhanced_mapping
+    
+    def analyze_relationships(self) -> pd.DataFrame:
+        """
+        Анализировать связи между таблицами
+        """
+        relationships = []
+        
+        # Проверяем возможные связи между таблицами
+        table_pairs = [
+            ('parts', 'oe', 'cross_references'),
+            ('parts', 'prices', 'parts'),
+            ('oe', 'cross_references', 'oe'),
+            ('parts', 'cross_references', 'parts')
+        ]
+        
+        for table1, table2, join_table in table_pairs:
+            try:
+                # Проверяем, есть ли общие ключи
+                if table1 == 'parts' and table2 == 'oe':
+                    # parts и oe связаны через cross_references
+                    query = f"""
+                    SELECT 
+                        COUNT(*) as relationship_count,
+                        'parts-oe-via-cross' as relationship_type
+                    FROM {join_table}
+                    JOIN parts ON {join_table}.artikul_norm = parts.artikul_norm 
+                        AND {join_table}.brand_norm = parts.brand_norm
+                    JOIN oe ON {join_table}.oe_number_norm = oe.oe_number_norm
+                    """
+                    
+                elif table1 == 'parts' and table2 == 'prices':
+                    # parts и prices связаны напрямую по ключам
+                    query = f"""
+                    SELECT 
+                        COUNT(*) as relationship_count,
+                        'parts-prices-direct' as relationship_type
+                    FROM {table1}
+                    JOIN {table2} ON {table1}.artikul_norm = {table2}.artikul_norm 
+                        AND {table1}.brand_norm = {table2}.brand_norm
+                    """
+                    
+                result = self.catalog.conn.execute(query).fetchone()
+                if result:
+                    relationships.append({
+                        'table1': table1,
+                        'table2': table2,
+                        'join_table': join_table,
+                        'relationship_count': result[0],
+                        'relationship_type': result[1]
+                    })
+            except Exception as e:
+                logger.warning(f"Ошибка анализа связи {table1}-{table2}: {e}")
+        
+        return pd.DataFrame(relationships) if relationships else pd.DataFrame(
+            columns=['table1', 'table2', 'join_table', 'relationship_count', 'relationship_type']
+        )
+
+def main():
+    st.set_page_config(
+        page_title="Каталог автозапчастей",
+        page_icon="🚗",
+        layout="wide"
+    )
+    
+    st.title("🚗 Каталог автозапчастей")
+    
+    # Инициализация каталога
+    catalog = get_high_volume_catalog()
+    
+    # Инициализация процессора данных
+    processor = AdvancedDataProcessor(catalog)
+    
+    # Боковая панель навигации
+    st.sidebar.header("Навигация")
+    page = st.sidebar.radio(
+        "Выберите раздел:",
+        [
+            "📊 Статистика",
+            "📤 Экспорт данных",
+            "📥 Экспорт всех данных",
+            "🔗 Power Query стиль",
+            "🔍 Анализ связей",
+            "🔧 Управление данными",
+            "💰 Цены и наценки",
+            "🚫 Исключения",
+            "🗂️ Категории",
+            "☁️ Облако"
+        ]
+    )
+    
+    # Отображение выбранной страницы
+    if page == "📊 Статистика":
+        catalog.show_statistics()
+    elif page == "📤 Экспорт данных":
+        catalog.show_export_interface()
+    elif page == "📥 Экспорт всех данных":
+        catalog.show_full_export_interface()
+    elif page == "🔗 Power Query стиль":
+        catalog.show_power_query_interface()
+    elif page == "🔍 Анализ связей":
+        show_relationship_analysis(processor)
+    elif page == "🔧 Управление данными":
+        catalog.show_data_management()
+    elif page == "💰 Цены и наценки":
+        catalog.show_price_settings()
+    elif page == "🚫 Исключения":
+        catalog.show_exclusion_settings()
+    elif page == "🗂️ Категории":
+        catalog.show_category_mapping()
+    elif page == "☁️ Облако":
+        catalog.show_cloud_sync()
+
+def show_relationship_analysis(processor: AdvancedDataProcessor):
+    """
+    Отображение анализа связей между таблицами
+    """
+    st.header("🔍 Анализ связей между таблицами")
+    st.info("Показывает, как связаны различные таблицы в базе данных")
+    
+    with st.spinner("Анализ связей..."):
+        relationships_df = processor.analyze_relationships()
+    
+    if not relationships_df.empty:
+        st.subheader("Обнаруженные связи")
+        st.dataframe(relationships_df, use_container_width=True)
+        
+        # Визуализация связей
+        st.subheader("Граф связей")
+        # Создаем простую визуализацию связей
+        import plotly.graph_objects as go
+        
+        # Подготовка данных для графа
+        nodes = list(set(list(relationships_df['table1']) + list(relationships_df['table2'])))
+        node_indices = {node: i for i, node in enumerate(nodes)}
+        
+        edges_x = []
+        edges_y = []
+        edge_texts = []
+        
+        for _, row in relationships_df.iterrows():
+            x0, y0 = node_indices[row['table1']], 0
+            x1, y1 = node_indices[row['table2']], 1
+            edges_x.extend([x0, x1, None])
+            edges_y.extend([y0, y1, None])
+            edge_texts.extend([row['relationship_type']] * 3)
+        
+        fig = go.Figure(data=go.Scatter(
+            x=edges_x,
+            y=edges_y,
+            mode='lines+markers+text',
+            line=dict(width=2, color='blue'),
+            marker=dict(size=10),
+            text=[node for node in nodes] + [''] * (len(edges_x) - len(nodes)),
+            textposition="middle center"
+        ))
+        
+        fig.update_layout(
+            title="Связи между таблицами",
+            xaxis=dict(
+                tickmode='array',
+                tickvals=list(range(len(nodes))),
+                ticktext=nodes
+            ),
+            yaxis=dict(
+                tickmode='array',
+                tickvals=[0, 1],
+                ticktext=['Table 1', 'Table 2']
+            ),
+            showlegend=False
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("Не удалось обнаружить связи между таблицами")
+
+# Расширение класса каталога для поддержки дополнительных функций
+
+def add_advanced_features_to_catalog():
+    """
+    Добавляет расширенные функции к существующему классу
+    """
+    def get_column_statistics(self, table_name: str, column_name: str) -> Dict[str, Any]:
+        """
+        Получить статистику по столбцу
+        """
+        try:
+            # Проверяем тип данных столбца
+            type_query = f"PRAGMA table_info({table_name})"
+            type_result = self.conn.execute(type_query).fetchall()
+            col_type = None
+            for row in type_result:
+                if row[1] == column_name:  # row[1] - имя столбца
+                    col_type = row[2]  # row[2] - тип данных
+                    break
+            
+            stats = {
+                'table': table_name,
+                'column': column_name,
+                'data_type': col_type,
+                'total_records': 0,
+                'non_null_count': 0,
+                'null_count': 0,
+                'distinct_count': 0,
+                'min_value': None,
+                'max_value': None,
+                'avg_value': None,
+                'most_common_values': []
+            }
+            
+            # Получаем общую статистику
+            general_query = f"""
+            SELECT 
+                COUNT(*) as total,
+                COUNT({column_name}) as non_null,
+                COUNT(*) - COUNT({column_name}) as nulls,
+                COUNT(DISTINCT {column_name}) as distinct_vals
+            FROM {table_name}
+            """
+            
+            general_result = self.conn.execute(general_query).fetchone()
+            stats['total_records'] = general_result[0]
+            stats['non_null_count'] = general_result[1]
+            stats['null_count'] = general_result[2]
+            stats['distinct_count'] = general_result[3]
+            
+            # Для числовых столбцов получаем дополнительную статистику
+            if col_type and any(numeric_type in col_type.lower() for numeric_type in ['int', 'float', 'double', 'real', 'numeric']):
+                numeric_query = f"""
+                SELECT 
+                    MIN({column_name}) as min_val,
+                    MAX({column_name}) as max_val,
+                    AVG({column_name}) as avg_val
+                FROM {table_name}
+                WHERE {column_name} IS NOT NULL
+                """
+                
+                numeric_result = self.conn.execute(numeric_query).fetchone()
+                if numeric_result:
+                    stats['min_value'] = numeric_result[0]
+                    stats['max_value'] = numeric_result[1]
+                    stats['avg_value'] = numeric_result[2]
+            
+            # Получаем наиболее часто встречающиеся значения
+            common_query = f"""
+            SELECT {column_name}, COUNT(*) as count
+            FROM {table_name}
+            WHERE {column_name} IS NOT NULL
+            GROUP BY {column_name}
+            ORDER BY count DESC
+            LIMIT 10
+            """
+            
+            common_results = self.conn.execute(common_query).fetchall()
+            stats['most_common_values'] = [{'value': row[0], 'count': row[1]} for row in common_results]
+            
+            return stats
+        except Exception as e:
+            logger.error(f"Ошибка получения статистики для {table_name}.{column_name}: {e}")
+            return {}
+    
+    def show_column_analysis(self):
+        """
+        Интерфейс для анализа столбцов
+        """
+        st.header("📊 Анализ столбцов")
+        st.info("Получите подробную статистику по отдельным столбцам")
+        
+        # Получаем все столбцы
+        tables_info = self.get_all_table_columns()
+        
+        # Выбор таблицы и столбца
+        all_options = []
+        for table, cols in tables_info.items():
+            for col in cols:
+                all_options.append((table, col))
+        
+        selected_option = st.selectbox(
+            "Выберите столбец для анализа:",
+            options=all_options,
+            format_func=lambda x: f"{x[0]}.{x[1]}"
+        )
+        
+        if selected_option and st.button("🔍 Проанализировать"):
+            table_name, column_name = selected_option
+            with st.spinner(f"Анализ столбца {table_name}.{column_name}..."):
+                stats = self.get_column_statistics(table_name, column_name)
+            
+            if stats:
+                # Отображаем статистику
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Всего записей", f"{stats['total_records']:,}")
+                col2.metric("Заполнено", f"{stats['non_null_count']:,}")
+                col3.metric("Пусто", f"{stats['null_count']:,}")
+                
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Уникальных", f"{stats['distinct_count']:,}")
+                col2.metric("Тип данных", stats['data_type'] or "Неизвестен")
+                
+                if stats['data_type'] and any(numeric_type in stats['data_type'].lower() 
+                                             for numeric_type in ['int', 'float', 'double', 'real', 'numeric']):
+                    col3.metric("Среднее", f"{stats['avg_value'] or 0:.2f}")
+                
+                # Отображаем диапазон для числовых данных
+                if stats.get('min_value') is not None and stats.get('max_value') is not None:
+                    st.subheader("Диапазон значений")
+                    col1, col2 = st.columns(2)
+                    col1.metric("Минимум", f"{stats['min_value']}")
+                    col2.metric("Максимум", f"{stats['max_value']}")
+                
+                # Часто встречающиеся значения
+                if stats['most_common_values']:
+                    st.subheader("Часто встречающиеся значения")
+                    common_df = pd.DataFrame(stats['most_common_values'])
+                    st.dataframe(common_df, use_container_width=True)
+            else:
+                st.error("Не удалось получить статистику для выбранного столбца")
+    
+    # Добавляем методы к классу
+    HighVolumeAutoPartsCatalog.get_column_statistics = get_column_statistics
+    HighVolumeAutoPartsCatalog.show_column_analysis = show_column_analysis
+
+# Добавляем расширенные функции
+add_advanced_features_to_catalog()
+
+# Обновляем основную функцию для включения новой страницы
+def main_updated():
+    st.set_page_config(
+        page_title="Каталог автозапчастей",
+        page_icon="🚗",
+        layout="wide"
+    )
+    
+    st.title("🚗 Каталог автозапчастей")
+    
+    # Инициализация каталога
+    catalog = get_high_volume_catalog()
+    
+    # Инициализация процессора данных
+    processor = AdvancedDataProcessor(catalog)
+    
+    # Боковая панель навигации
+    st.sidebar.header("Навигация")
+    page = st.sidebar.radio(
+        "Выберите раздел:",
+        [
+            "📊 Статистика",
+            "📈 Анализ столбцов",
+            "📤 Экспорт данных",
+            "📥 Экспорт всех данных",
+            "🔗 Power Query стиль",
+            "🔍 Анализ связей",
+            "🔧 Управление данными",
+            "💰 Цены и наценки",
+            "🚫 Исключения",
+            "🗂️ Категории",
+            "☁️ Облако"
+        ]
+    )
+    
+    # Отображение выбранной страницы
+    if page == "📊 Статистика":
+        catalog.show_statistics()
+    elif page == "📈 Анализ столбцов":
+        catalog.show_column_analysis()
+    elif page == "📤 Экспорт данных":
+        catalog.show_export_interface()
+    elif page == "📥 Экспорт всех данных":
+        catalog.show_full_export_interface()
+    elif page == "🔗 Power Query стиль":
+        catalog.show_power_query_interface()
+    elif page == "🔍 Анализ связей":
+        show_relationship_analysis(processor)
+    elif page == "🔧 Управление данными":
+        catalog.show_data_management()
+    elif page == "💰 Цены и наценки":
+        catalog.show_price_settings()
+    elif page == "🚫 Исключения":
+        catalog.show_exclusion_settings()
+    elif page == "🗂️ Категории":
+        catalog.show_category_mapping()
+    elif page == "☁️ Облако":
+        catalog.show_cloud_sync()
+
+if __name__ == "__main__":
+    main_updated()
