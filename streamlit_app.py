@@ -1,15 +1,11 @@
 # ============================================================================
-# БЛОК 11: HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ПОЛНАЯ ВЕРСИЯ v100.24)
+# БЛОК 11: HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ПОЛНАЯ ВЕРСИЯ v100.25)
 # ============================================================================
-# ✅ НОВОЕ v100.22/v100.23/v100.24:
-# 1. VLOOKUP-style парсинг столбцов с гибким выбором
-# 2. Power Query подобные трансформации данных
-# 3. Визуальный конструктор запросов
-# 4. Профили парсинга
-# 5. Маппинг колонок с машинным обучением
-# 6. Пакетная обработка с разными правилами
-# 7. ✅ v100.23: Истинный потоковый экспорт (DuckDB COPY + Chunked Excel)
-# 8. ✅ v100.24: Экспорт результата Power Query (CSV + Excel)
+# ✅ ИСПРАВЛЕНИЕ v100.25:
+# 1. Исправлена проблема "Нет данных для экспорта" после обработки файлов
+# 2. batch_vlookup_parse теперь возвращает {file_type: DataFrame}
+# 3. Добавлен st.rerun() после загрузки данных
+# 4. Улучшено определение типа файла по имени
 # ============================================================================
 
 import streamlit as st
@@ -508,7 +504,7 @@ class PowerQueryBuilder:
 
 
 # ============================================================================
-# ОСНОВНОЙ КЛАСС КАТАЛОГА (ОБНОВЛЕННЫЙ)
+# ОСНОВНОЙ КЛАСС КАТАЛОГА (ОБНОВЛЕННЫЙ v100.25)
 # ============================================================================
 
 @st.cache_resource
@@ -895,7 +891,7 @@ class HighVolumeAutoPartsCatalog:
             
             if df.is_empty():
                 logger.warning(f"Пустой файл: {file_path}")
-                st.warning(f"⚠️ Файл '{Path(file_path).name}' пуст или не содержит табличных данных.")
+                st.warning(f"️ Файл '{Path(file_path).name}' пуст или не содержит табличных данных.")
                 return pl.DataFrame()
             
             logger.info(f"Исходные колонки: {df.columns}")
@@ -956,7 +952,7 @@ class HighVolumeAutoPartsCatalog:
             return pl.DataFrame()
     
     # ========================================================================
-    # ✅ НОВЫЙ МЕТОД: Пакетный VLOOKUP-парсинг
+    # ✅ ИСПРАВЛЕННЫЙ МЕТОД v100.25: Пакетный VLOOKUP-парсинг
     # ========================================================================
     def batch_vlookup_parse(self, file_paths: List[str], 
                            column_selection: Dict[str, List[str]] = None,
@@ -964,6 +960,11 @@ class HighVolumeAutoPartsCatalog:
                            apply_power_query: bool = False) -> Dict[str, pl.DataFrame]:
         """
         Пакетный VLOOKUP-парсинг нескольких файлов
+        
+        ✅ ИСПРАВЛЕНИЕ v100.25: Возвращает {file_type: DataFrame} вместо {file_path: DataFrame}
+        
+        Returns:
+            Словарь {тип_файла: DataFrame} где тип_файла = 'oe', 'cross', 'prices' и т.д.
         """
         results = {}
         
@@ -974,13 +975,18 @@ class HighVolumeAutoPartsCatalog:
             if column_selection and file_path in column_selection:
                 columns = column_selection[file_path]
             
+            # ✅ УЛУЧШЕНОЕ ОПРЕДЕЛЕНИЕ ТИПА ФАЙЛА ПО ИМЕНИ
             filename = Path(file_path).stem.lower()
-            if "price" in filename:
-                file_type = "price_list"
-            elif "catalog" in filename:
+            if "price" in filename or "прайс" in filename or "цен" in filename:
+                file_type = "prices"
+            elif "oe" in filename or "кросс" in filename or "cross" in filename:
+                file_type = "cross"
+            elif "catalog" in filename or "каталог" in filename:
                 file_type = "catalog"
-            elif "inventory" in filename or "stock" in filename:
+            elif "inventory" in filename or "stock" in filename or "склад" in filename:
                 file_type = "inventory"
+            else:
+                file_type = "oe"  # По умолчанию считаем OE файл
             
             profile = use_profile if use_profile else file_type if file_type in self.column_parser.parsing_rules.get("custom_parsing_rules", {}) else None
             
@@ -992,8 +998,13 @@ class HighVolumeAutoPartsCatalog:
             )
             
             if not df.is_empty():
-                results[file_path] = df
-                logger.info(f"✅ Успешно обработан: {file_path} ({len(df)} строк, {len(df.columns)} колонок)")
+                # ✅ ИСПРАВЛЕНИЕ: Используем file_type как ключ, а не путь к файлу
+                if file_type in results:
+                    # Если уже есть данные этого типа, объединяем
+                    results[file_type] = pl.concat([results[file_type], df])
+                else:
+                    results[file_type] = df
+                logger.info(f"✅ Успешно обработан: {file_path} как {file_type} ({len(df)} строк)")
             else:
                 logger.warning(f"❌ Не удалось обработать: {file_path}")
         
@@ -1124,7 +1135,7 @@ class HighVolumeAutoPartsCatalog:
         """Обработка и загрузка данных в базу"""
         st.info("🔄 Начало загрузки и обновления данных в базе...")
         
-        steps = [s for s in ['oe', 'cross', 'parts'] if s in dataframes]
+        steps = [s for s in ['oe', 'cross', 'prices', 'catalog'] if s in dataframes]
         num_steps = len(steps)
         
         progress_bar = st.progress(0, text="Подготовка к обновлению базы данных...")
@@ -1184,114 +1195,132 @@ class HighVolumeAutoPartsCatalog:
         
         # ШАГ 3: Обработка цен
         if 'prices' in dataframes:
+            step_counter += 1
+            progress_bar.progress(step_counter / (num_steps + 1),
+                                  text=f"({step_counter}/{num_steps}) Обработка цен...")
+            
             price_df = dataframes['prices']
             if not price_df.is_empty():
                 st.info("💰 Обработка цен...")
                 self.upsert_prices(price_df)
                 st.success(f"✅ Успешно обновлено {len(price_df)} ценовых записей")
         
-        # ШАГ 4: Сборка данных по артикулам
-        step_counter += 1
-        progress_bar.progress(step_counter / (num_steps + 1),
-                              text=f"({step_counter}/{num_steps}) Сборка данных по артикулам...")
-        
-        parts_df = None
-        file_priority = ['oe', 'dimensions', 'barcode', 'images']
-        key_files = {ftype: df for ftype, df in dataframes.items() if ftype in file_priority}
-        
-        if key_files:
-            parts_to_concat = [
-                df.select(['artikul', 'artikul_norm', 'brand', 'brand_norm'])
-                for df in key_files.values()
-                if 'artikul_norm' in df.columns and 'brand_norm' in df.columns and not df.is_empty()
-            ]
+        # ШАГ 4: Обработка catalog (если есть)
+        if 'catalog' in dataframes:
+            step_counter += 1
+            progress_bar.progress(step_counter / (num_steps + 1),
+                                  text=f"({step_counter}/{num_steps}) Обработка каталога...")
             
-            if parts_to_concat:
-                all_parts = pl.concat(parts_to_concat).filter(
-                    pl.col('artikul_norm') != ""
-                ).unique(subset=['artikul_norm', 'brand_norm'], keep='first')
-                parts_df = all_parts
-            else:
-                parts_df = pl.DataFrame()
+            df = dataframes['catalog']
+            if not df.is_empty() and 'artikul_norm' in df.columns:
+                self.upsert_data('parts', df, ['artikul_norm', 'brand_norm'])
+                st.success(f"✅ Обновлено {len(df)} записей каталога")
         
-        if parts_df is not None and not parts_df.is_empty():
-            for ftype in file_priority:
-                if ftype not in key_files:
-                    continue
+        # ШАГ 5: Сборка данных по артикулам (если нет catalog)
+        if 'catalog' not in dataframes:
+            step_counter += 1
+            progress_bar.progress(step_counter / (num_steps + 1),
+                                  text=f"({step_counter}/{num_steps}) Сборка данных по артикулам...")
+            
+            parts_df = None
+            file_priority = ['oe', 'dimensions', 'barcode', 'images']
+            key_files = {ftype: df for ftype, df in dataframes.items() if ftype in file_priority}
+            
+            if key_files:
+                parts_to_concat = [
+                    df.select(['artikul', 'artikul_norm', 'brand', 'brand_norm'])
+                    for df in key_files.values()
+                    if 'artikul_norm' in df.columns and 'brand_norm' in df.columns and not df.is_empty()
+                ]
                 
-                df = key_files[ftype]
-                if df.is_empty() or 'artikul_norm' not in df.columns:
-                    continue
-                
-                if ftype in ['oe', 'dimensions']:
-                    dims_to_add = ['length', 'width', 'height', 'weight', 'dimensions_str']
-                    join_cols = [col for col in dims_to_add if col in df.columns]
+                if parts_to_concat:
+                    all_parts = pl.concat(parts_to_concat).filter(
+                        pl.col('artikul_norm') != ""
+                    ).unique(subset=['artikul_norm', 'brand_norm'], keep='first')
+                    parts_df = all_parts
                 else:
-                    join_cols = [col for col in df.columns if col not in [
-                        'artikul', 'artikul_norm', 'brand', 'brand_norm']]
-                
-                if not join_cols:
-                    continue
-                
-                existing_cols = set(parts_df.columns)
-                join_cols = [col for col in join_cols if col not in existing_cols]
-                if not join_cols:
-                    continue
-                
-                df_subset = df.select(['artikul_norm', 'brand_norm'] + join_cols).unique(
-                    subset=['artikul_norm', 'brand_norm'], keep='first')
-                parts_df = parts_df.join(
-                    df_subset, on=['artikul_norm', 'brand_norm'], how='left', coalesce=True)
+                    parts_df = pl.DataFrame()
             
-            if 'multiplicity' not in parts_df.columns:
-                parts_df = parts_df.with_columns(multiplicity=pl.lit(1).cast(pl.Int32))
-            else:
-                parts_df = parts_df.with_columns(pl.col('multiplicity').fill_null(1).cast(pl.Int32))
-            
-            for col in ['length', 'width', 'height', 'weight']:
-                if col not in parts_df.columns:
-                    parts_df = parts_df.with_columns(pl.lit(0.0).cast(pl.Float64).alias(col))
+            if parts_df is not None and not parts_df.is_empty():
+                for ftype in file_priority:
+                    if ftype not in key_files:
+                        continue
+                    
+                    df = key_files[ftype]
+                    if df.is_empty() or 'artikul_norm' not in df.columns:
+                        continue
+                    
+                    if ftype in ['oe', 'dimensions']:
+                        dims_to_add = ['length', 'width', 'height', 'weight', 'dimensions_str']
+                        join_cols = [col for col in dims_to_add if col in df.columns]
+                    else:
+                        join_cols = [col for col in df.columns if col not in [
+                            'artikul', 'artikul_norm', 'brand', 'brand_norm']]
+                    
+                    if not join_cols:
+                        continue
+                    
+                    existing_cols = set(parts_df.columns)
+                    join_cols = [col for col in join_cols if col not in existing_cols]
+                    if not join_cols:
+                        continue
+                    
+                    df_subset = df.select(['artikul_norm', 'brand_norm'] + join_cols).unique(
+                        subset=['artikul_norm', 'brand_norm'], keep='first')
+                    parts_df = parts_df.join(
+                        df_subset, on=['artikul_norm', 'brand_norm'], how='left', coalesce=True)
+                
+                if 'multiplicity' not in parts_df.columns:
+                    parts_df = parts_df.with_columns(multiplicity=pl.lit(1).cast(pl.Int32))
                 else:
-                    parts_df = parts_df.with_columns(
-                        pl.col(col).fill_null(0).cast(pl.Float64).alias(col)
-                    )
-            
-            if 'dimensions_str' not in parts_df.columns:
-                parts_df = parts_df.with_columns(dimensions_str=pl.lit(None).cast(pl.Utf8))
-            
-            if 'artikul' not in parts_df.columns:
-                parts_df = parts_df.with_columns(artikul=pl.lit(''))
-            if 'brand' not in parts_df.columns:
-                parts_df = parts_df.with_columns(brand=pl.lit(''))
-            
-            parts_df = parts_df.with_columns([
-                pl.col('artikul').cast(pl.Utf8).fill_null('').alias('_artikul_str'),
-                pl.col('brand').cast(pl.Utf8).fill_null('').alias('_brand_str'),
-                pl.col('multiplicity').cast(pl.Utf8).alias('_multiplicity_str'),
-            ])
-            
-            parts_df = parts_df.with_columns(
-                description=pl.concat_str([
-                    pl.lit('Артикул: '), pl.col('_artikul_str'),
-                    pl.lit(', Бренд: '), pl.col('_brand_str'),
-                    pl.lit(', Кратность: '), pl.col('_multiplicity_str'), pl.lit(' шт.')
-                ], separator='')
-            )
-            
-            parts_df = parts_df.drop(['_artikul_str', '_brand_str', '_multiplicity_str'])
-            
-            final_columns = [
-                'artikul_norm', 'brand_norm', 'artikul', 'brand', 'multiplicity', 'barcode',
-                'length', 'width', 'height', 'weight', 'image_url', 'dimensions_str', 'description'
-            ]
-            select_exprs = [pl.col(c) if c in parts_df.columns else pl.lit(None).alias(c) for c in final_columns]
-            parts_df = parts_df.select(select_exprs)
-            
-            self.upsert_data('parts', parts_df, ['artikul_norm', 'brand_norm'])
+                    parts_df = parts_df.with_columns(pl.col('multiplicity').fill_null(1).cast(pl.Int32))
+                
+                for col in ['length', 'width', 'height', 'weight']:
+                    if col not in parts_df.columns:
+                        parts_df = parts_df.with_columns(pl.lit(0.0).cast(pl.Float64).alias(col))
+                    else:
+                        parts_df = parts_df.with_columns(
+                            pl.col(col).fill_null(0).cast(pl.Float64).alias(col)
+                        )
+                
+                if 'dimensions_str' not in parts_df.columns:
+                    parts_df = parts_df.with_columns(dimensions_str=pl.lit(None).cast(pl.Utf8))
+                
+                if 'artikul' not in parts_df.columns:
+                    parts_df = parts_df.with_columns(artikul=pl.lit(''))
+                if 'brand' not in parts_df.columns:
+                    parts_df = parts_df.with_columns(brand=pl.lit(''))
+                
+                parts_df = parts_df.with_columns([
+                    pl.col('artikul').cast(pl.Utf8).fill_null('').alias('_artikul_str'),
+                    pl.col('brand').cast(pl.Utf8).fill_null('').alias('_brand_str'),
+                    pl.col('multiplicity').cast(pl.Utf8).alias('_multiplicity_str'),
+                ])
+                
+                parts_df = parts_df.with_columns(
+                    description=pl.concat_str([
+                        pl.lit('Артикул: '), pl.col('_artikul_str'),
+                        pl.lit(', Бренд: '), pl.col('_brand_str'),
+                        pl.lit(', Кратность: '), pl.col('_multiplicity_str'), pl.lit(' шт.')
+                    ], separator='')
+                )
+                
+                parts_df = parts_df.drop(['_artikul_str', '_brand_str', '_multiplicity_str'])
+                
+                final_columns = [
+                    'artikul_norm', 'brand_norm', 'artikul', 'brand', 'multiplicity', 'barcode',
+                    'length', 'width', 'height', 'weight', 'image_url', 'dimensions_str', 'description'
+                ]
+                select_exprs = [pl.col(c) if c in parts_df.columns else pl.lit(None).alias(c) for c in final_columns]
+                parts_df = parts_df.select(select_exprs)
+                
+                self.upsert_data('parts', parts_df, ['artikul_norm', 'brand_norm'])
         
         progress_bar.progress(1.0, text="Обновление базы данных завершено!")
         time.sleep(1)
         progress_bar.empty()
+        
+        st.success("✅ Данные успешно загружены в базу!")
     
     # ========================================================================
     # ЭКСПОРТ
@@ -1505,9 +1534,6 @@ class HighVolumeAutoPartsCatalog:
         
         return "\n".join([line.rstrip() for line in query.strip().splitlines()])
 
-    # ========================================================================
-    # ✅ v100.23: ПОТОКОВЫЙ ЭКСПОРТ (БЕЗ ЗАГРУЗКИ В RAM)
-    # ========================================================================
     def export_streaming_csv(self, query: str, output_path: str) -> bool:
         """Использует нативный COPY DuckDB для потоковой записи на диск без загрузки в RAM"""
         try:
@@ -1753,7 +1779,6 @@ class HighVolumeAutoPartsCatalog:
         include_prices = st.checkbox("Включить цены", value=True)
         apply_markup = st.checkbox("Применить наценку", value=True, disabled=not include_prices)
         
-        # ✅ НОВОЕ: Выбор режима экспорта
         use_streaming = st.checkbox(
             "⚡ Использовать потоковый экспорт (Рекомендуется для файлов > 100 000 строк, экономит RAM)", 
             value=True
@@ -1937,7 +1962,7 @@ class HighVolumeAutoPartsCatalog:
         
         self.cloud_config['sync_interval'] = st.number_input("Интервал (сек)", min_value=300, max_value=86400, value=int(self.cloud_config['sync_interval']))
         
-        if st.button("💾 Сохранить настройки"):
+        if st.button(" Сохранить настройки"):
             self.save_cloud_config()
             st.success("Настройки сохранены")
         
@@ -1983,18 +2008,15 @@ class HighVolumeAutoPartsCatalog:
             st.subheader("Топ 10 брендов")
             st.dataframe(stats['top_brands'])
     
-    # ========================================================================
-    # ✅ НОВЫЙ ИНТЕРФЕЙС: VLOOKUP ПАРСИНГ И POWER QUERY
-    # ========================================================================
     def show_vlookup_parsing_interface(self):
         """Интерфейс VLOOKUP-парсинга с Power Query"""
         st.header("🎯 VLOOKUP Парсинг + Power Query")
         
         tab1, tab2, tab3, tab4 = st.tabs([
-            "📋 VLOOKUP Парсинг", 
-            "⚡ Power Query Конструктор", 
+            " VLOOKUP Парсинг", 
+            " Power Query Конструктор", 
             "💾 Сохраненные запросы",
-            "🔧 Настройки маппинга"
+            " Настройки маппинга"
         ])
         
         with tab1:
@@ -2261,7 +2283,6 @@ class HighVolumeAutoPartsCatalog:
                                 st.success("✅ Трансформации применены!")
                                 st.dataframe(result_df.head(20).to_pandas(), use_container_width=True)
                                 
-                                # ✅ v100.24: ЭКСПОРТ РЕЗУЛЬТАТА POWER QUERY
                                 st.markdown("---")
                                 st.subheader("📥 Экспорт результата трансформации")
                                 
@@ -2321,7 +2342,7 @@ class HighVolumeAutoPartsCatalog:
             return
         
         for query in saved_queries:
-            with st.expander(f"📝 {query['name']} (создан: {query['created_at']})"):
+            with st.expander(f" {query['name']} (создан: {query['created_at']})"):
                 st.write(f"**Описание:** {query.get('description', 'Нет описания')}")
                 st.write(f"**ID:** {query['id']}")
                 
@@ -2343,7 +2364,7 @@ class HighVolumeAutoPartsCatalog:
     
     def _show_mapping_settings_tab(self):
         """Вкладка настроек маппинга колонок"""
-        st.subheader("🔧 Настройки маппинга колонок")
+        st.subheader(" Настройки маппинга колонок")
         st.info("Настройте соответствие между названиями колонок в файлах и системными названиями")
         
         column_mappings = self.column_parser.parsing_rules.get("column_mappings", {})
@@ -2364,7 +2385,7 @@ class HighVolumeAutoPartsCatalog:
             
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("💾 Сохранить изменения"):
+                if st.button(" Сохранить изменения"):
                     new_variants = [v.strip() for v in variants_text.split("\n") if v.strip()]
                     column_mappings[target_column] = new_variants
                     self.column_parser.save_parsing_rules()
@@ -2464,7 +2485,7 @@ class HighVolumeAutoPartsCatalog:
                 "Удалить по бренду": "🏭 Удалить все записи бренда",
                 "Удалить по артикули": "📦 Удалить все записи артикула",
                 "Управление ценами": "💰 Цены и наценки",
-                "Исключения": "🚫 Исключения при экспорте",
+                "Исключения": " Исключения при экспорте",
                 "Категории": "🗂️ Категории товаров",
                 "Облачная синхронизация": "☁️ Облачная синхронизация"
             }[x]
@@ -2553,7 +2574,7 @@ def main():
         initial_sidebar_state="expanded"
     )
     
-    st.title("🚗 High-Volume Каталог Автозапчастей Pro")
+    st.title(" High-Volume Каталог Автозапчастей Pro")
     st.markdown("---")
     
     catalog = get_high_volume_catalog()
@@ -2564,7 +2585,7 @@ def main():
         main_section = st.radio(
             "Раздел:",
             [
-                "📤 Экспорт данных",
+                " Экспорт данных",
                 "📊 Статистика",
                 "🔧 Управление данными",
                 "🎯 VLOOKUP + Power Query"
@@ -2573,7 +2594,7 @@ def main():
         
         st.markdown("---")
         
-        st.subheader("⚡ Быстрые действия")
+        st.subheader(" Быстрые действия")
         
         uploaded_files = st.file_uploader(
             "Загрузить файлы данных",
@@ -2585,31 +2606,42 @@ def main():
         if uploaded_files:
             if st.button("🚀 Обработать файлы", type="primary"):
                 with st.spinner("Обработка файлов..."):
-                    file_paths = {}
+                    file_paths = []
                     for uploaded_file in uploaded_files:
                         temp_path = catalog.data_dir / f"upload_{uploaded_file.name}"
                         temp_path.write_bytes(uploaded_file.getvalue())
-                        file_paths[uploaded_file.name] = str(temp_path)
+                        file_paths.append(str(temp_path))
                     
+                    # ✅ ИСПРАВЛЕНИЕ v100.25: batch_vlookup_parse теперь возвращает {file_type: DataFrame}
                     results = catalog.batch_vlookup_parse(
-                        list(file_paths.values()),
-                        use_profile="catalog"
+                        file_paths,
+                        use_profile=None  # Убираем жесткий профиль, пусть определяет автоматически
                     )
                     
                     if results:
-                        catalog.process_and_load_data(results)
-                        st.success(f"✅ Загружено {len(results)} файлов")
+                        st.info(f" Обработано типов файлов: {len(results)}")
+                        for file_type, df in results.items():
+                            st.write(f"• **{file_type}**: {len(df)} строк")
                         
-                        for path in file_paths.values():
+                        catalog.process_and_load_data(results)
+                        st.success(f"✅ Загружено {len(results)} типов файлов")
+                        
+                        # Очистка временных файлов
+                        for path in file_paths:
                             try:
                                 os.remove(path)
                             except Exception:
                                 pass
+                        
+                        # ✅ ВАЖНО: Перезагружаем страницу для обновления статистики
+                        st.rerun()
+                    else:
+                        st.error("❌ Не удалось обработать ни один файл")
     
     if main_section == "📤 Экспорт данных":
         catalog.show_export_interface()
     
-    elif main_section == "📊 Статистика":
+    elif main_section == " Статистика":
         catalog.show_statistics()
     
     elif main_section == "🔧 Управление данными":
