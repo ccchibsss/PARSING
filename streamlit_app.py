@@ -21,6 +21,15 @@ import threading
 import hashlib
 from collections import OrderedDict
 import gc
+import matplotlib.pyplot as plt
+import seaborn as sns
+import networkx as nx
+from pyvis.network import Network
+import plotly.graph_objects as go
+import plotly.express as px
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+from matplotlib_venn import venn2, venn3
 
 # Импорты для Excel/CSV
 import pyarrow as pa
@@ -1849,7 +1858,6 @@ class HighVolumeAutoPartsCatalog:
         df = self.conn.execute(final_query).df()
         return df
 
-
 def show_power_query_interface(catalog: HighVolumeAutoPartsCatalog):
     st.header("🔗 Power Query-стиль мердж данных")
     st.info("Настройте объединение таблиц по общим значениям")
@@ -1997,6 +2005,388 @@ def show_power_query_interface(catalog: HighVolumeAutoPartsCatalog):
         else:
             st.warning("Добавьте хотя бы одну операцию объединения")
 
+def analyze_graph_structure(catalog):
+    """
+    Анализ структуры графа взаимосвязей между артикулами и OE номерами
+    """
+    st.header("📊 Анализ структуры графа")
+    
+    # Загрузка данных из базы
+    graph_data = catalog.conn.execute("""
+        SELECT 
+            cr.artikul_norm,
+            cr.brand_norm,
+            cr.oe_number_norm,
+            p.artikul,
+            p.brand,
+            o.name as part_name,
+            o.category
+        FROM cross_references cr
+        LEFT JOIN parts p ON cr.artikul_norm = p.artikul_norm AND cr.brand_norm = p.brand_norm
+        LEFT JOIN oe o ON cr.oe_number_norm = o.oe_number_norm
+    """).df()
+    
+    if graph_data.empty:
+        st.warning("Нет данных для анализа графа")
+        return
+    
+    # Создание графа NetworkX
+    G = nx.Graph()
+    
+    # Добавление узлов и ребер
+    for _, row in graph_data.iterrows():
+        # Узлы: артикул-бренд и OE номер
+        part_node = f"{row['artikul']} ({row['brand']})"
+        oe_node = row['oe_number_norm']
+        
+        # Добавляем узлы
+        G.add_node(part_node, node_type='part', name=row['artikul'], brand=row['brand'])
+        if pd.notna(oe_node):
+            G.add_node(oe_node, node_type='oe', name=oe_node)
+            # Добавляем ребро между артикулом и OE номером
+            G.add_edge(part_node, oe_node)
+    
+    # Статистика графа
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Узлов", G.number_of_nodes())
+    col2.metric("Рёбер", G.number_of_edges())
+    col3.metric("Компонентов", nx.number_connected_components(G))
+    col4.metric("Плотность", f"{nx.density(G):.4f}")
+    
+    # Выбор типа визуализации
+    viz_type = st.selectbox("Тип визуализации", 
+                           ["Статическая сеть", "Интерактивная сеть", "Кластеризация", "Цепочки"])
+    
+    if viz_type == "Статическая сеть":
+        # Статическая визуализация
+        fig, ax = plt.subplots(figsize=(12, 8))
+        
+        # Позиционирование узлов
+        pos = nx.spring_layout(G, k=1, iterations=50)
+        
+        # Разделение узлов по типу
+        part_nodes = [node for node, attr in G.nodes(data=True) if attr['node_type'] == 'part']
+        oe_nodes = [node for node, attr in G.nodes(data=True) if attr['node_type'] == 'oe']
+        
+        # Рисование рёбер
+        nx.draw_networkx_edges(G, pos, alpha=0.5, edge_color='gray')
+        
+        # Рисование узлов
+        nx.draw_networkx_nodes(G, pos, nodelist=part_nodes, node_color='lightblue', 
+                              node_size=300, label='Артикулы')
+        nx.draw_networkx_nodes(G, pos, nodelist=oe_nodes, node_color='orange', 
+                              node_size=200, label='OE номера')
+        
+        # Подписи только для части узлов, чтобы не перегружать
+        labels = {}
+        for node in list(G.nodes())[:50]:  # Только первые 50 узлов
+            labels[node] = node[:10] + "..." if len(node) > 10 else node
+        
+        nx.draw_networkx_labels(G, pos, labels, font_size=8)
+        
+        ax.legend()
+        ax.axis('off')
+        st.pyplot(fig)
+        plt.close()
+    
+    elif viz_type == "Интерактивная сеть":
+        # Интерактивная визуализация с Pyvis
+        net = Network(height="600px", width="100%", bgcolor="#ffffff", font_color="black")
+        
+        # Добавляем узлы
+        for node, attr in G.nodes(data=True):
+            if attr['node_type'] == 'part':
+                net.add_node(node, label=node, color='lightblue', shape='circle')
+            else:
+                net.add_node(node, label=node, color='orange', shape='square')
+        
+        # Добавляем рёбра
+        for edge in G.edges():
+            net.add_edge(edge[0], edge[1])
+        
+        # Настройки сети
+        net.set_options("""
+        var options = {
+          "nodes": {
+            "font": {
+              "size": 12
+            }
+          },
+          "edges": {
+            "color": "gray",
+            "smooth": {
+              "type": "continuous"
+            }
+          },
+          "physics": {
+            "enabled": true,
+            "stabilization": {"iterations": 100}
+          }
+        }
+        """)
+        
+        # Сохраняем и отображаем
+        net.save_graph("graph.html")
+        HtmlFile = open("graph.html", 'r', encoding='utf-8')
+        source_code = HtmlFile.read()
+        st.components.v1.html(source_code, height=600)
+    
+    elif viz_type == "Кластеризация":
+        # Анализ кластеров
+        clusters = list(nx.connected_components(G))
+        
+        st.subheader(f"Кластеры (всего: {len(clusters)})")
+        
+        cluster_sizes = [len(cluster) for cluster in clusters]
+        fig_cluster = px.histogram(x=cluster_sizes, nbins=20, 
+                                   title="Распределение размеров кластеров")
+        st.plotly_chart(fig_cluster)
+        
+        # Топ 10 самых больших кластеров
+        largest_clusters = sorted(clusters, key=len, reverse=True)[:10]
+        cluster_data = []
+        for i, cluster in enumerate(largest_clusters):
+            cluster_data.append({
+                'Cluster': f'Кластер {i+1}',
+                'Size': len(cluster),
+                'Nodes': list(cluster)[:5]  # Показываем первые 5 узлов
+            })
+        
+        cluster_df = pd.DataFrame(cluster_data)
+        st.dataframe(cluster_df)
+    
+    elif viz_type == "Цепочки":
+        # Анализ цепочек связности
+        chains = []
+        for component in nx.connected_components(G):
+            subgraph = G.subgraph(component)
+            if len(component) > 1:
+                # Найдем диаметр компоненты (самый длинный путь)
+                try:
+                    diameter = nx.diameter(subgraph)
+                    chains.append({
+                        'Component Size': len(component),
+                        'Diameter': diameter,
+                        'Density': nx.density(subgraph)
+                    })
+                except nx.NetworkXNoPathError:
+                    # Если граф несвязный внутри компоненты
+                    chains.append({
+                        'Component Size': len(component),
+                        'Diameter': 1,
+                        'Density': nx.density(subgraph)
+                    })
+        
+        if chains:
+            chains_df = pd.DataFrame(chains)
+            fig_chains = px.scatter(chains_df, x='Component Size', y='Diameter', 
+                                   size='Density', title="Анализ цепочек связности")
+            st.plotly_chart(fig_chains)
+
+def analyze_cross_references(catalog):
+    """
+    Анализ кросс-ссылок и взаимозаменяемости
+    """
+    st.header("🔄 Анализ кросс-ссылок")
+    
+    # Загрузка данных
+    cross_data = catalog.conn.execute("""
+        SELECT 
+            cr.oe_number_norm,
+            cr.artikul_norm,
+            cr.brand_norm,
+            p.artikul,
+            p.brand,
+            o.name,
+            o.category
+        FROM cross_references cr
+        LEFT JOIN parts p ON cr.artikul_norm = p.artikul_norm AND cr.brand_norm = p.brand_norm
+        LEFT JOIN oe o ON cr.oe_number_norm = o.oe_number_norm
+    """).df()
+    
+    if cross_data.empty:
+        st.warning("Нет данных для анализа кросс-ссылок")
+        return
+    
+    # Статистика кросс-ссылок
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Уникальных OE номеров", cross_data['oe_number_norm'].nunique())
+    col2.metric("Уникальных артикулов", cross_data['artikul_norm'].nunique())
+    col3.metric("Всего связей", len(cross_data))
+    
+    # Анализ множественных соответствий
+    st.subheader("Множественные соответствия")
+    
+    # OE -> несколько артикулов
+    oe_counts = cross_data.groupby('oe_number_norm').size().reset_index(name='count')
+    multiple_oem = oe_counts[oe_counts['count'] > 1]
+    
+    if not multiple_oem.empty:
+        st.write(f"OE номера с несколькими аналогами: {len(multiple_oem)}")
+        top_multiple_oem = multiple_oem.nlargest(10, 'count')
+        fig_oem = px.bar(top_multiple_oem, x='oe_number_norm', y='count', 
+                         title="Топ OE номеров с наибольшим количеством аналогов")
+        st.plotly_chart(fig_oem)
+    
+    # Артикул -> несколько OE
+    art_counts = cross_data.groupby(['artikul_norm', 'brand_norm']).size().reset_index(name='count')
+    multiple_art = art_counts[art_counts['count'] > 1]
+    
+    if not multiple_art.empty:
+        st.write(f"Артикулы с несколькими OE номерами: {len(multiple_art)}")
+        top_multiple_art = multiple_art.nlargest(10, 'count')
+        fig_art = px.bar(top_multiple_art, x=top_multiple_art.apply(lambda x: f"{x['artikul_norm']} ({x['brand_norm']})", axis=1), 
+                         y='count', title="Топ артикулов с наибольшим количеством OE номеров")
+        st.plotly_chart(fig_art)
+    
+    # Анализ по брендам
+    st.subheader("Распределение по брендам")
+    brand_dist = cross_data.groupby('brand').size().reset_index(name='count')
+    brand_dist = brand_dist.sort_values('count', ascending=False)
+    
+    fig_brand = px.pie(brand_dist.head(10), values='count', names='brand', 
+                       title="Топ 10 брендов по количеству кросс-ссылок")
+    st.plotly_chart(fig_brand)
+    
+    # Анализ по категориям
+    st.subheader("Распределение по категориям")
+    cat_dist = cross_data.groupby('category').size().reset_index(name='count')
+    cat_dist = cat_dist.sort_values('count', ascending=False)
+    
+    fig_cat = px.bar(cat_dist.head(10), x='category', y='count', 
+                     title="Топ 10 категорий по количеству кросс-ссылок")
+    st.plotly_chart(fig_cat)
+
+def analyze_categories(catalog):
+    """
+    Анализ распределения и взаимосвязей по категориям
+    """
+    st.header("🏷️ Анализ категорий")
+    
+    # Загрузка данных
+    category_data = catalog.conn.execute("""
+        SELECT 
+            o.category,
+            o.name,
+            cr.oe_number_norm,
+            cr.artikul_norm,
+            cr.brand_norm,
+            p.brand
+        FROM oe o
+        LEFT JOIN cross_references cr ON o.oe_number_norm = cr.oe_number_norm
+        LEFT JOIN parts p ON cr.artikul_norm = p.artikul_norm AND cr.brand_norm = p.brand_norm
+    """).df()
+    
+    if category_data.empty:
+        st.warning("Нет данных для анализа категорий")
+        return
+    
+    # Статистика по категориям
+    cat_stats = category_data.groupby('category').agg({
+        'oe_number_norm': 'nunique',
+        'artikul_norm': 'nunique',
+        'brand': 'nunique'
+    }).rename(columns={
+        'oe_number_norm': 'Уникальных OE',
+        'artikul_norm': 'Уникальных артикулов',
+        'brand': 'Уникальных брендов'
+    }).reset_index()
+    
+    cat_stats = cat_stats.sort_values('Уникальных OE', ascending=False)
+    
+    st.subheader("Статистика по категориям")
+    st.dataframe(cat_stats)
+    
+    # Визуализация
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        fig1 = px.bar(cat_stats.head(10), x='category', y='Уникальных OE',
+                      title="Топ 10 категорий по OE номерам")
+        st.plotly_chart(fig1, use_container_width=True)
+    
+    with col2:
+        fig2 = px.bar(cat_stats.head(10), x='category', y='Уникальных артикулов',
+                      title="Топ 10 категорий по артикулам")
+        st.plotly_chart(fig2, use_container_width=True)
+    
+    # Облако тегов для категорий
+    st.subheader("Облако тегов категорий")
+    text = " ".join(category_data['category'].dropna().tolist())
+    
+    if text.strip():
+        wordcloud = WordCloud(width=800, height=400, background_color='white').generate(text)
+        
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.imshow(wordcloud, interpolation='bilinear')
+        ax.axis('off')
+        st.pyplot(fig)
+        plt.close()
+    
+    # Анализ популярных названий в категориях
+    st.subheader("Популярные слова в названиях по категориям")
+    
+    category_words = {}
+    for cat in category_data['category'].dropna().unique()[:10]:  # Только топ 10 категорий
+        cat_names = category_data[category_data['category'] == cat]['name'].dropna()
+        all_words = []
+        for name in cat_names:
+            words = re.findall(r'\b\w+\b', str(name).lower())
+            all_words.extend(words)
+        
+        common_words = Counter(all_words).most_common(10)
+        category_words[cat] = common_words
+    
+    # Показать топ слова для каждой категории
+    for cat, words in category_words.items():
+        st.write(f"**{cat}**: {', '.join([w[0] for w in words[:5]])}")
+
+def show_graph_analysis_interface(catalog):
+    """
+    Интерфейс для анализа графа и кросс-ссылок
+    """
+    analysis_type = st.sidebar.selectbox(
+        "Тип анализа",
+        ["Структура графа", "Кросс-ссылки", "Анализ категорий"]
+    )
+    
+    if analysis_type == "Структура графа":
+        analyze_graph_structure(catalog)
+    elif analysis_type == "Кросс-ссылки":
+        analyze_cross_references(catalog)
+    elif analysis_type == "Анализ категорий":
+        analyze_categories(catalog)
+
+def show_upload_interface(catalog):
+    """
+    Интерфейс для загрузки файлов
+    """
+    st.header("📥 Загрузка данных")
+    
+    uploaded_files = st.file_uploader(
+        "Выберите Excel файлы для загрузки",
+        type=['xlsx', 'xls'],
+        accept_multiple_files=True
+    )
+    
+    if uploaded_files:
+        file_paths = {}
+        for uploaded_file in uploaded_files:
+            file_path = catalog.data_dir / uploaded_file.name
+            with open(file_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            file_paths[uploaded_file.name] = str(file_path)
+        
+        st.success(f"Загружено {len(uploaded_files)} файлов")
+        
+        if st.button("🚀 Обработать и загрузить в базу"):
+            with st.spinner("Обработка файлов..."):
+                dataframes = catalog.merge_all_data_parallel(file_paths)
+                if dataframes:
+                    catalog.process_and_load_data(dataframes)
+                    st.success("Данные успешно загружены в базу")
+                else:
+                    st.error("Не удалось обработать файлы")
 
 def main():
     st.set_page_config(
@@ -2019,6 +2409,8 @@ def main():
             "📊 Статистика", 
             "📤 Экспорт данных",
             "🔗 Power Query мердж",
+            "📈 Анализ графа",
+            "📥 Загрузка данных",
             "🔧 Управление данными"
         ]
     )
@@ -2044,6 +2436,12 @@ def main():
     
     elif page == "🔗 Power Query мердж":
         show_power_query_interface(catalog)
+    
+    elif page == "📈 Анализ графа":
+        show_graph_analysis_interface(catalog)
+    
+    elif page == "📥 Загрузка данных":
+        show_upload_interface(catalog)
     
     elif page == "🔧 Управление данными":
         catalog.show_data_management()
