@@ -401,63 +401,68 @@ class HighVolumeAutoPartsCatalog:
     # ========================================================================
     # ✅ ОБРАБОТКА ФАЙЛОВ (ИСПРАВЛЕНО v100.20)
     # ========================================================================
-    def detect_columns(self, actual_columns: List[str], expected_columns: List[str]) -> Dict[str, str]:
-        """
-        ✅ ИСПРАВЛЕНИЕ v100.18: Защита от дубликатов при маппинге колонок
-        """
-        column_variants = {
-            'oe_number': ['oe номер', 'oe', 'оe', 'номер', 'code', 'OE', 'oe_number', 'oe number'],
-            'artikul': ['артикул', 'article', 'sku', 'artikul', 'код товара', 'код', 'код артикула'],
-            'brand': ['бренд', 'brand', 'производитель', 'manufacturer', 'марка'],
-            'name': ['наименование', 'название', 'name', 'описание', 'description', 'товар', 'наименование товара'],
-            'applicability': ['применимость', 'автомобиль', 'vehicle', 'applicability', 'применяемость'],
-            'barcode': ['штрих-код', 'barcode', 'штрихкод', 'ean', 'eac13', 'штрих код'],
-            'multiplicity': ['кратность шт', 'кратность', 'multiplicity', 'кратность упаковки'],
-            'length': ['длина (см)', 'длина', 'length', 'длинна', 'длина, см', 'length_cm'],
-            'width': ['ширина (см)', 'ширина', 'width', 'ширина, см', 'width_cm'],
-            'height': ['высота (см)', 'высота', 'height', 'высота, см', 'height_cm'],
-            'weight': ['вес (кг)', 'вес, кг', 'вес', 'weight', 'масса', 'weight_kg', 'вес кг'],
-            'image_url': ['ссылка', 'url', 'изображение', 'image', 'картинка', 'фото', 'ссылка на изображение'],
-            'dimensions_str': ['весогабариты', 'размеры', 'dimensions', 'size', 'габариты', 'длинна/ширина/высота', 'длина/ширина/высота'],
-            'price': ['цена', 'price', 'рекомендованная цена', 'retail price', 'цена продажи', 'стоимость'],
-            'currency': ['валюта', 'currency']
-        }
+# Обновляем функцию detect_columns в классе HighVolumeAutoPartsCatalog
+def detect_columns(self, actual_columns: List[str], expected_columns: List[str]) -> Dict[str, str]:
+    """
+    ✅ РАСШИРЕННОЕ СОПОСТАВЛЕНИЕ КОЛОНОК С ВАШИМИ ФАЙЛАМИ
+    """
+    column_variants = {
+        'oe_number': ['oe номер', 'oe', 'оe', 'номер', 'code', 'OE', 'oe_number', 'oe number', 'OE'],
+        'artikul': ['артикул', 'article', 'sku', 'artikul', 'код товара', 'код', 'код артикула', 'Артикул'],
+        'brand': ['бренд', 'brand', 'производитель', 'manufacturer', 'марка', 'Бренд'],
+        'name': ['наименование', 'название', 'name', 'описание', 'description', 'товар', 'наименование товара', 'Наименование'],
+        'applicability': ['применимость', 'автомобиль', 'vehicle', 'applicability', 'применяемость', 'Марка авто', 'Применимость'],
+        'barcode': ['штрих-код', 'barcode', 'штрихкод', 'ean', 'eac13', 'штрих код', 'EAN13'],
+        'multiplicity': ['кратность шт', 'кратность', 'multiplicity', 'кратность упаковки', 'Кратность'],
+        'length': ['длина (см)', 'длина', 'length', 'длинна', 'длина, см', 'length_cm'],
+        'width': ['ширина (см)', 'ширина', 'width', 'ширина, см', 'width_cm'],
+        'height': ['высота (см)', 'высота', 'height', 'высота, см', 'height_cm'],
+        'weight': ['вес (кг)', 'вес, кг', 'вес', 'weight', 'масса', 'weight_kg', 'вес кг'],
+        'image_url': ['ссылка', 'url', 'изображение', 'image', 'картинка', 'фото', 'ссылка на изображение', 'Ссылка на изображение'],
+        'dimensions_str': ['весогабариты', 'размеры', 'dimensions', 'size', 'габариты', 'длинна/ширина/высота', 'длина/ширина/высота'],
+        'price': ['цена', 'price', 'рекомендованная цена', 'retail price', 'цена продажи', 'стоимость'],
+        'currency': ['валюта', 'currency'],
+        'oe': ['OE', 'oe', 'номер OE', 'OE номер', 'OE-номер']
+    }
+    
+    actual_lower = {col.lower().strip(): col for col in actual_columns}
+    mapping = {}
+    used_actual = set()
+    
+    for expected in expected_columns:
+        variants = column_variants.get(expected, [expected])
         
-        actual_lower = {col.lower().strip(): col for col in actual_columns}
-        mapping = {}
-        used_actual = set()
+        best_match = None
+        best_score = -1
         
-        for expected in expected_columns:
-            variants = column_variants.get(expected, [expected])
+        for variant in variants:
+            variant_lower = variant.lower().strip()
             
-            best_match = None
-            best_score = -1
-            
-            for variant in variants:
-                variant_lower = variant.lower().strip()
+            for actual_l, actual_orig in actual_lower.items():
+                if actual_orig in used_actual:
+                    continue
                 
-                for actual_l, actual_orig in actual_lower.items():
-                    if actual_orig in used_actual:
-                        continue
-                    
-                    score = 0
-                    if variant_lower == actual_l:
-                        score = 100
-                    elif variant_lower in actual_l:
-                        score = 50 + len(variant_lower)
-                    elif actual_l in variant_lower:
-                        score = 30 + len(actual_l)
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_match = actual_orig
-            
-            if best_match and best_score > 0:
-                mapping[best_match] = expected
-                used_actual.add(best_match)
+                score = 0
+                if variant_lower == actual_l:
+                    score = 100
+                elif variant_lower in actual_l:
+                    score = 50 + len(variant_lower)
+                elif actual_l in variant_lower:
+                    score = 30 + len(actual_l)
+                # Добавим частичное совпадение
+                elif any(word in actual_l for word in variant_lower.split()):
+                    score = 20 + len([w for w in variant_lower.split() if w in actual_l])
+                
+                if score > best_score:
+                    best_score = score
+                    best_match = actual_orig
         
-        logger.info(f"Маппинг колонок: {mapping}")
-        return mapping
+        if best_match and best_score > 0:
+            mapping[best_match] = expected
+            used_actual.add(best_match)
+    
+    logger.info(f"Маппинг колонок: {mapping}")
+    return mapping
     
     def read_and_prepare_file(self, file_path: str, file_type: str) -> pl.DataFrame:
         """
