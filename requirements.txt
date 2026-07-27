@@ -13,30 +13,9 @@ duckdb>=1.0.0,<2.0.0
 
 # Работа с файлами Excel
 openpyxl>=3.1.0,<4.0.0  # Для записи Excel
-calamine-pandas>=0.0.9  # Для чтения Excel через Polars (calamine)
+
+# Чтение Excel через Polars (использует fastexcel под капотом)
+fastexcel>=0.9.0
 
 # Работа с файлами CSV/Parquet (обычно входят в состав pandas/polars, но можно указать явно)
 pyarrow>=16.0.0,<20.0.0  # Для поддержки Arrow в Polars/DuckDB
-
-# Стандартная библиотека Python (указывать не обязательно, но для ясности)
-# pathlib (входит в stdlib с Python 3.4)
-# json (входит в stdlib)
-# time (входит в stdlib)
-# re (входит в stdlib)
-# math (входит в stdlib)
-# decimal (входит в stdlib)
-# threading (входит в stdlib)
-# datetime (входит в stdlib)
-# logging (входит в stdlib)
-# typing (входит в stdlib)
-# concurrent.futures (входит в stdlib)
-# io (входит в stdlib)
-# os (входит в stdlib)
-# warnings (входит в stdlib)
-# zipfile (входит в stdlib)
-
-# Кодеки и форматы (обычно входят в состав Python или других библиотек)
-# codecs (входит в stdlib)
-# csv (входит в stdlib, но pandas использует свою реализацию для to_csv)
-
-# Примечание: Убедитесь, что версия Python >= 3.9, так как Polars v1+ требует Python 3.9+
