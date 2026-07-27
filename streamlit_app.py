@@ -1,38 +1,27 @@
+# app.py
 import streamlit as st
 import pandas as pd
-import numpy as np
-from pathlib import Path
-import io
-import os
-import json
-import logging
-from typing import Dict, List, Tuple, Optional, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
-import math
-import re
-import decimal
-from datetime import datetime, date, timedelta
 import polars as pl
 import duckdb
-import tempfile
-from zipfile import ZipFile
-import threading
-import hashlib
-from collections import OrderedDict
-import gc
-
-# Импорты для Excel/CSV
-import pyarrow as pa
-from openpyxl import Workbook
-from openpyxl.utils.dataframe import dataframe_to_rows
+from pathlib import Path
+import json
+import time
+import re
+import math
+import decimal
+from datetime import datetime, date, timedelta
+import logging
+from typing import Dict, List, Any, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import io
+import os
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Константы
-EXCEL_ROW_LIMIT = 1_048_576  # Максимум строк в Excel
+EXCEL_ROW_LIMIT = 1_048_576  # Максимальное количество строк в Excel
 
 # ============================================================================
 # БЛОК 11: HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ПОЛНАЯ ВЕРСИЯ v100.21)
@@ -51,7 +40,6 @@ EXCEL_ROW_LIMIT = 1_048_576  # Максимум строк в Excel
 def get_high_volume_catalog():
     """Создание каталога через st.cache_resource для корректной работы с DuckDB"""
     return HighVolumeAutoPartsCatalog()
-
 
 class HighVolumeAutoPartsCatalog:
     def __init__(self):
@@ -1732,312 +1720,377 @@ class HighVolumeAutoPartsCatalog:
                     st.rerun()
     
     # ========================================================================
-    # НОВЫЙ ФУНКЦИОНАЛ: ЗАГРУЗКА ФАЙЛОВ
+    # НОВАЯ ФУНКЦИОНАЛЬНОСТЬ: ГРУППИРОВКА СТОЛБЦОВ (Power Query стиль)
     # ========================================================================
-    def show_upload_interface(self):
-        st.header("📥 Загрузка данных")
+    def get_all_table_columns(self) -> Dict[str, List[str]]:
+        """Получить все столбцы из всех таблиц"""
+        tables_info = {}
         
-        uploaded_files = st.file_uploader(
-            "Выберите Excel файлы для загрузки",
-            type=['xlsx', 'xls'],
-            accept_multiple_files=True
+        # Получаем информацию о столбцах для каждой таблицы
+        tables = ['oe', 'parts', 'cross_references', 'prices']
+        
+        for table in tables:
+            try:
+                result = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+                columns = [row[1] for row in result]  # Второй элемент - имя столбца
+                tables_info[table] = columns
+            except Exception as e:
+                logger.error(f"Ошибка получения информации о столбцах таблицы {table}: {e}")
+                tables_info[table] = []
+        
+        return tables_info
+    
+    def build_grouping_query(self, group_by_columns: List[Tuple[str, str]], 
+                            target_columns: List[Tuple[str, str]], 
+                            aggregation_method: str = 'first') -> str:
+        """
+        Построение SQL-запроса для группировки данных
+        
+        Args:
+            group_by_columns: [(table_name, column_name), ...] - столбцы для группировки
+            target_columns: [(table_name, column_name), ...] - целевые столбцы для агрегации
+            aggregation_method: метод агрегации ('first', 'last', 'sum', 'avg', 'max', 'min')
+        """
+        # Формируем SELECT часть запроса
+        select_parts = []
+        
+        # Добавляем столбцы для группировки
+        for table_name, col_name in group_by_columns:
+            select_parts.append(f"{table_name}.{col_name} AS \"{col_name}\"")
+        
+        # Добавляем целевые столбцы с агрегацией
+        agg_functions = {
+            'first': 'FIRST',
+            'last': 'LAST',
+            'sum': 'SUM',
+            'avg': 'AVG',
+            'max': 'MAX',
+            'min': 'MIN'
+        }
+        
+        agg_func = agg_functions.get(aggregation_method, 'FIRST')
+        
+        for table_name, col_name in target_columns:
+            # Для числовых колонок используем агрегацию, для текстовых - FIRST
+            select_parts.append(f"{agg_func}({table_name}.{col_name}) AS \"{col_name}\"")
+        
+        # Формируем JOIN части
+        join_parts = []
+        
+        # Определяем возможные связи между таблицами
+        table_joins = {
+            ('parts', 'oe'): 'cross_references.artikul_norm = parts.artikul_norm AND cross_references.brand_norm = parts.brand_norm',
+            ('oe', 'parts'): 'cross_references.artikul_norm = parts.artikul_norm AND cross_references.brand_norm = parts.brand_norm',
+            ('cross_references', 'oe'): 'cross_references.oe_number_norm = oe.oe_number_norm',
+            ('cross_references', 'parts'): 'cross_references.artikul_norm = parts.artikul_norm AND cross_references.brand_norm = parts.brand_norm',
+            ('prices', 'parts'): 'prices.artikul_norm = parts.artikul_norm AND prices.brand_norm = parts.brand_norm',
+            ('parts', 'prices'): 'prices.artikul_norm = parts.artikul_norm AND prices.brand_norm = parts.brand_norm'
+        }
+        
+        # Собираем все уникальные таблицы, участвующие в запросе
+        all_tables = set()
+        for table_name, _ in group_by_columns + target_columns:
+            all_tables.add(table_name)
+        
+        all_tables = list(all_tables)
+        
+        # Если только одна таблица - просто выбираем из неё
+        if len(all_tables) == 1:
+            main_table = all_tables[0]
+            query = f"""
+            SELECT {', '.join(select_parts)}
+            FROM {main_table}
+            GROUP BY {', '.join([f'{col[1]}' for col in group_by_columns])}
+            ORDER BY {', '.join([f'{col[1]}' for col in group_by_columns])}
+            """
+        else:
+            # Иначе строим JOIN-запрос
+            main_table = all_tables[0]
+            from_clause = f"FROM {main_table}"
+            
+            for i, table in enumerate(all_tables[1:], 1):
+                # Пытаемся найти подходящий JOIN
+                join_found = False
+                for (t1, t2), condition in table_joins.items():
+                    if t1 == main_table and t2 == table:
+                        join_parts.append(f"LEFT JOIN {table} ON {condition}")
+                        join_found = True
+                        break
+                    elif t2 == main_table and t1 == table:
+                        join_parts.append(f"LEFT JOIN {table} ON {condition}")
+                        join_found = True
+                        break
+                
+                if not join_found:
+                    # Если не нашли явную связь, делаем CROSS JOIN (это может быть неэффективно)
+                    join_parts.append(f"CROSS JOIN {table}")
+            
+            query = f"""
+            SELECT {', '.join(select_parts)}
+            {from_clause}
+            {' '.join(join_parts)}
+            GROUP BY {', '.join([f'{col[1]}' for col in group_by_columns])}
+            ORDER BY {', '.join([f'{col[1]}' for col in group_by_columns])}
+            """
+        
+        return query
+    
+    def execute_grouping_query(self, group_by_columns: List[Tuple[str, str]], 
+                             target_columns: List[Tuple[str, str]], 
+                             aggregation_method: str = 'first') -> pd.DataFrame:
+        """Выполнение запроса группировки и возврат результата"""
+        query = self.build_grouping_query(group_by_columns, target_columns, aggregation_method)
+        
+        try:
+            df = pd.read_sql(query, self.conn)
+            return df
+        except Exception as e:
+            logger.error(f"Ошибка выполнения запроса группировки: {e}")
+            st.error(f"Ошибка выполнения запроса: {str(e)}")
+            return pd.DataFrame()
+    
+    def show_power_query_interface(self):
+        """Интерфейс для Power Query стиля группировки"""
+        st.header("🔗 Power Query стиль группировки")
+        st.info("Выберите столбцы для группировки и целевые столбцы для подтягивания значений")
+        
+        # Получаем информацию о всех столбцах
+        tables_info = self.get_all_table_columns()
+        
+        # Разделение на колонки для группировки и целевые
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Столбцы для группировки")
+            group_options = []
+            for table, cols in tables_info.items():
+                for col in cols:
+                    group_options.append((table, col))
+            
+            selected_group_cols = st.multiselect(
+                "Выберите столбцы для группировки:",
+                options=group_options,
+                format_func=lambda x: f"{x[0]}.{x[1]}"
+            )
+        
+        with col2:
+            st.subheader("Целевые столбцы для подтягивания")
+            target_options = []
+            for table, cols in tables_info.items():
+                for col in cols:
+                    # Исключаем уже выбранные столбцы для группировки
+                    if (table, col) not in selected_group_cols:
+                        target_options.append((table, col))
+            
+            selected_target_cols = st.multiselect(
+                "Выберите целевые столбцы:",
+                options=target_options,
+                format_func=lambda x: f"{x[0]}.{x[1]}"
+            )
+        
+        # Метод агрегации
+        aggregation_method = st.selectbox(
+            "Метод агрегации:",
+            options=['first', 'last', 'sum', 'avg', 'max', 'min'],
+            format_func=lambda x: {
+                'first': 'Первое значение',
+                'last': 'Последнее значение',
+                'sum': 'Сумма',
+                'avg': 'Среднее',
+                'max': 'Максимум',
+                'min': 'Минимум'
+            }[x]
         )
         
-        if uploaded_files:
-            file_paths = {}
-            for uploaded_file in uploaded_files:
-                file_path = self.data_dir / uploaded_file.name
-                with open(file_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                file_paths[uploaded_file.name] = str(file_path)
-            
-            st.success(f"Загружено {len(uploaded_files)} файлов")
-            
-            if st.button("🚀 Обработать и загрузить в базу"):
-                with st.spinner("Обработка файлов..."):
-                    dataframes = self.merge_all_data_parallel(file_paths)
-                    if dataframes:
-                        self.process_and_load_data(dataframes)
-                        st.success("Данные успешно загружены в базу")
-                    else:
-                        st.error("Не удалось обработать файлы")
-
-    # ========================================================================
-    # НОВЫЙ ФУНКЦИОНАЛ: POWER QUERY-СТИЛЬ МЕРДЖА
-    # ========================================================================
-    def get_all_table_names(self) -> List[str]:
-        """Получить все имена таблиц из базы данных"""
-        result = self.conn.execute("SHOW TABLES").fetchall()
-        return [row[0] for row in result]
-    
-    def get_table_columns(self, table_name: str) -> List[str]:
-        """Получить имена колонок из таблицы"""
-        result = self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-        return [row[1] for row in result]
-    
-    def get_sample_data(self, table_name: str, limit: int = 5) -> pd.DataFrame:
-        """Получить пример данных из таблицы"""
-        return self.conn.execute(f"SELECT * FROM {table_name} LIMIT {limit}").df()
-    
-    def execute_power_query_merge(self, operations: List[Dict[str, Any]], selected_columns: List[str] = None) -> pd.DataFrame:
-        """
-        Выполнить сложный мердж нескольких таблиц с возможностью выбора колонок
-        
-        operations - список операций мерджа:
-        [
-            {
-                'table1': 'table_name1',
-                'table2': 'table_name2',
-                'columns1': ['col1', 'col2'],
-                'columns2': ['col1', 'col2'],
-                'join_type': 'inner' | 'left' | 'right' | 'outer',
-                'result_table': 'temp_table_name'
-            },
-            ...
-        ]
-        """
-        if not operations:
-            # Если нет операций, просто вернем все данные из основных таблиц
-            base_query = """
-                SELECT 
-                    p.artikul_norm, p.brand_norm, p.artikul, p.brand,
-                    p.multiplicity, p.barcode, p.length, p.width, p.height, p.weight,
-                    p.image_url, p.dimensions_str, p.description,
-                    o.name as name, o.applicability as applicability, o.category as category,
-                    c.oe_number_norm,
-                    pr.price, pr.currency
-                FROM parts p
-                LEFT JOIN oe o ON p.artikul_norm = o.oe_number_norm
-                LEFT JOIN cross_references c ON p.artikul_norm = c.artikul_norm AND p.brand_norm = c.brand_norm
-                LEFT JOIN prices pr ON p.artikul_norm = pr.artikul_norm AND p.brand_norm = c.brand_norm
-            """
-            df = self.conn.execute(base_query).df()
-            if selected_columns:
-                df = df[selected_columns]
-            return df
-        
-        # Используем временную CTE для выполнения операций
-        # Строим SQL запрос с учетом всех операций
-        initial_table = operations[0]['table1']
-        current_table = initial_table
-        current_alias = f"t{0}"
-        
-        # Начинаем строить SQL запрос
-        sql_parts = [f"WITH merged_data AS ("]
-        
-        # Первый элемент
-        sql_parts.append(f"SELECT * FROM {initial_table} AS {current_alias}")
-        
-        for i, op in enumerate(operations[1:], 1):
-            table2 = op['table2']
-            alias2 = f"t{i}"
-            
-            # Определяем условие джойна
-            join_conditions = []
-            for col1, col2 in zip(op['columns1'], op['columns2']):
-                join_conditions.append(f"{current_alias}.{col1} = {alias2}.{col2}")
-            join_condition_str = " AND ".join(join_conditions)
-            
-            # Определяем тип джойна
-            join_type = op['join_type'].upper()
-            if join_type == 'INNER':
-                join_clause = f"INNER JOIN {table2} AS {alias2} ON {join_condition_str}"
-            elif join_type == 'LEFT':
-                join_clause = f"LEFT JOIN {table2} AS {alias2} ON {join_condition_str}"
-            elif join_type == 'RIGHT':
-                join_clause = f"RIGHT JOIN {table2} AS {alias2} ON {join_condition_str}"
-            elif join_type == 'OUTER':
-                join_clause = f"FULL OUTER JOIN {table2} AS {alias2} ON {join_condition_str}"
-            else:
-                join_clause = f"LEFT JOIN {table2} AS {alias2} ON {join_condition_str}"  # по умолчанию
-            
-            sql_parts.append(f", {alias2} AS (SELECT * FROM {table2})")
-            current_alias = alias2
-        
-        # Завершаем CTE
-        sql_parts.append(")")
-        
-        # Теперь строим основной SELECT
-        # Получаем все возможные колонки из всех таблиц
-        all_tables = set()
-        for op in operations:
-            all_tables.add(op['table1'])
-            all_tables.add(op['table2'])
-        
-        # Получаем все колонки для SELECT
-        select_cols = []
-        if selected_columns:
-            # Если указаны конкретные колонки, используем их
-            for col in selected_columns:
-                select_cols.append(f"merged_data.{col} AS \"{col}\"")
-        else:
-            # Иначе используем все колонки из последней операции
-            last_op = operations[-1]
-            all_cols = set()
-            for table in all_tables:
-                cols = self.get_table_columns(table)
-                for col in cols:
-                    all_cols.add(f"merged_data.{col} AS \"{col}\"")
-            select_cols = list(all_cols)
-        
-        final_query = f"""
-        {' '.join(sql_parts)}
-        SELECT {', '.join(select_cols)}
-        FROM merged_data
-        """
-        
-        # Выполняем запрос
-        df = self.conn.execute(final_query).df()
-        return df
-
-
-def show_power_query_interface(catalog: HighVolumeAutoPartsCatalog):
-    st.header("🔗 Power Query-стиль мердж данных")
-    st.info("Настройте объединение таблиц по общим значениям")
-    
-    # Получаем список всех таблиц
-    all_tables = catalog.get_all_table_names()
-    
-    if not all_tables:
-        st.warning("Нет доступных таблиц для объединения")
-        return
-    
-    # Интерфейс для настройки операций
-    if 'merge_operations' not in st.session_state:
-        st.session_state.merge_operations = []
-    
-    st.subheader("Настройка операций объединения")
-    
-    # Добавление новой операции
-    with st.expander("➕ Добавить операцию объединения", expanded=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            table1 = st.selectbox("Первая таблица", options=all_tables, key="table1_new")
-        with col2:
-            table2 = st.selectbox("Вторая таблица", options=all_tables, key="table2_new")
-        
-        if table1 and table2:
-            cols1 = catalog.get_table_columns(table1)
-            cols2 = catalog.get_table_columns(table2)
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                selected_cols1 = st.multiselect(f"Колонки из {table1}", options=cols1, key="cols1_new")
-            with col2:
-                selected_cols2 = st.multiselect(f"Колонки из {table2}", options=cols2, key="cols2_new")
-            
-            # Проверяем, что количества колонок совпадают
-            if len(selected_cols1) != len(selected_cols2):
-                st.warning("Количество выбранных колонок должно совпадать для джойна")
-            else:
-                join_type = st.selectbox("Тип объединения", options=['inner', 'left', 'right', 'outer'], key="join_type_new")
+        # Кнопка выполнения
+        if st.button("🔍 Выполнить группировку") and selected_group_cols and selected_target_cols:
+            with st.spinner("Выполняется группировка..."):
+                result_df = self.execute_grouping_query(
+                    selected_group_cols, 
+                    selected_target_cols, 
+                    aggregation_method
+                )
                 
-                if st.button("Добавить операцию"):
-                    if len(selected_cols1) > 0:
-                        new_operation = {
-                            'table1': table1,
-                            'table2': table2,
-                            'columns1': selected_cols1,
-                            'columns2': selected_cols2,
-                            'join_type': join_type
-                        }
-                        st.session_state.merge_operations.append(new_operation)
-                        st.success(f"Операция добавлена: {table1} + {table2}")
-                        st.rerun()
-                    else:
-                        st.error("Выберите хотя бы одну колонку из каждой таблицы")
-    
-    # Отображение текущих операций
-    if st.session_state.merge_operations:
-        st.subheader("Текущие операции объединения")
-        for i, op in enumerate(st.session_state.merge_operations):
-            with st.container():
-                st.write(f"**Операция {i+1}:** {op['table1']} ←[{op['join_type']}]→ {op['table2']}")
-                st.write(f"По колонкам: {list(zip(op['columns1'], op['columns2']))}")
-                col1, col2, col3 = st.columns([1, 1, 2])
-                with col1:
-                    if st.button(f"📋 Пример {op['table1']}", key=f"sample1_{i}"):
-                        sample = catalog.get_sample_data(op['table1'])
-                        st.dataframe(sample)
-                with col2:
-                    if st.button(f"📋 Пример {op['table2']}", key=f"sample2_{i}"):
-                        sample = catalog.get_sample_data(op['table2'])
-                        st.dataframe(sample)
-                with col3:
-                    if st.button(f"🗑️ Удалить", key=f"delete_{i}"):
-                        del st.session_state.merge_operations[i]
-                        st.rerun()
-    
-    # Выбор колонок для итогового результата
-    st.subheader("Выбор колонок для экспорта")
-    all_available_cols = set()
-    for op in st.session_state.merge_operations:
-        all_available_cols.update(catalog.get_table_columns(op['table1']))
-        all_available_cols.update(catalog.get_table_columns(op['table2']))
-    
-    selected_export_cols = st.multiselect(
-        "Выберите колонки для итогового результата", 
-        options=sorted(list(all_available_cols)),
-        default=list(all_available_cols)[:10] if all_available_cols else []
-    )
-    
-    # Кнопка выполнения объединения
-    if st.button("🔍 Выполнить объединение и получить результат"):
-        if st.session_state.merge_operations:
-            with st.spinner("Выполняется объединение данных..."):
-                try:
-                    result_df = catalog.execute_power_query_merge(
-                        st.session_state.merge_operations, 
-                        selected_export_cols if selected_export_cols else None
-                    )
-                    st.success(f"Объединение выполнено успешно! Результат содержит {len(result_df)} строк и {len(result_df.columns)} колонок.")
+                if not result_df.empty:
+                    st.success(f"Найдено {len(result_df)} уникальных записей")
+                    st.dataframe(result_df, use_container_width=True)
                     
-                    # Показываем результат
-                    st.dataframe(result_df.head(100))  # Показываем первые 100 строк
-                    
-                    # Подготовка файлов для скачивания
-                    csv_buffer = io.StringIO()
-                    result_df.to_csv(csv_buffer, sep=';', index=False)
-                    
-                    excel_buffer = io.BytesIO()
-                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                        # Если данных больше лимита Excel, создаем несколько листов
-                        if len(result_df) > EXCEL_ROW_LIMIT:
-                            num_sheets = (len(result_df) // EXCEL_ROW_LIMIT) + 1
-                            for i in range(num_sheets):
-                                start_idx = i * EXCEL_ROW_LIMIT
-                                end_idx = min((i + 1) * EXCEL_ROW_LIMIT, len(result_df))
-                                result_df.iloc[start_idx:end_idx].to_excel(
-                                    writer, 
-                                    sheet_name=f'Результат_{i+1}', 
-                                    index=False
-                                )
-                        else:
-                            result_df.to_excel(writer, index=False)
-                    
-                    # Кнопки скачивания
+                    # Возможность экспорта результата
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.download_button(
-                            label="⬇️ Скачать CSV",
-                            data=csv_buffer.getvalue().encode('utf-8-sig'),
-                            file_name="merged_data.csv",
-                            mime="text/csv"
-                        )
+                        if st.button("📥 Экспорт CSV"):
+                            csv = result_df.to_csv(sep=';', index=False)
+                            st.download_button(
+                                label="Скачать CSV",
+                                data=csv.encode('utf-8-sig'),
+                                file_name="grouped_data.csv",
+                                mime="text/csv"
+                            )
+                    
                     with col2:
-                        st.download_button(
-                            label="⬇️ Скачать Excel",
-                            data=excel_buffer.getvalue(),
-                            file_name="merged_data.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
+                        if st.button("📥 Экспорт Excel"):
+                            excel_buffer = io.BytesIO()
+                            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                                result_df.to_excel(writer, index=False, sheet_name='Grouped Data')
+                            
+                            st.download_button(
+                                label="Скачать Excel",
+                                data=excel_buffer.getvalue(),
+                                file_name="grouped_data.xlsx",
+                                mime="application/vnd.ms-excel"
+                            )
+                else:
+                    st.warning("По указанным критериям не найдено данных")
+    
+    def show_full_export_interface(self):
+        """Интерфейс для экспорта всех данных"""
+        st.header("📥 Экспорт всех данных")
+        st.info("Выберите формат и столбцы для экспорта всех данных из базы")
+        
+        # Получаем все доступные столбцы из всех таблиц
+        all_columns = []
+        tables_info = self.get_all_table_columns()
+        
+        for table, cols in tables_info.items():
+            for col in cols:
+                all_columns.append(f"{table}.{col}")
+        
+        # Выбор столбцов для экспорта
+        selected_columns = st.multiselect(
+            "Выберите столбцы для экспорта:",
+            options=all_columns,
+            default=all_columns[:10]  # По умолчанию первые 10 столбцов
+        )
+        
+        # Формат экспорта
+        format_choice = st.radio("Формат экспорта:", ["CSV", "Excel"])
+        
+        # Кнопка экспорта
+        if st.button("📥 Экспортировать все данные"):
+            with st.spinner("Подготовка данных для экспорта..."):
+                try:
+                    # Формируем SQL-запрос для объединения всех таблиц
+                    # Создаем запрос с JOIN-ами между таблицами
+                    query = self.build_full_export_query(selected_columns)
+                    
+                    # Выполняем запрос
+                    df = pd.read_sql(query, self.conn)
+                    
+                    if not df.empty:
+                        st.success(f"Найдено {len(df)} записей для экспорта")
+                        
+                        if format_choice == "CSV":
+                            csv = df.to_csv(sep=';', index=False)
+                            st.download_button(
+                                label="Скачать CSV",
+                                data=csv.encode('utf-8-sig'),
+                                file_name="full_export.csv",
+                                mime="text/csv"
+                            )
+                        else:  # Excel
+                            excel_buffer = io.BytesIO()
+                            if len(df) <= EXCEL_ROW_LIMIT:
+                                with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                                    df.to_excel(writer, index=False, sheet_name='Full Export')
+                            else:
+                                sheets = (len(df) // EXCEL_ROW_LIMIT) + 1
+                                with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                                    for i in range(sheets):
+                                        start_idx = i * EXCEL_ROW_LIMIT
+                                        end_idx = min((i + 1) * EXCEL_ROW_LIMIT, len(df))
+                                        df_slice = df.iloc[start_idx:end_idx]
+                                        df_slice.to_excel(
+                                            writer, 
+                                            index=False, 
+                                            sheet_name=f'Sheet_{i+1}'
+                                        )
+                            
+                            st.download_button(
+                                label="Скачать Excel",
+                                data=excel_buffer.getvalue(),
+                                file_name="full_export.xlsx",
+                                mime="application/vnd.ms-excel"
+                            )
+                    else:
+                        st.warning("Не найдено данных для экспорта")
                         
                 except Exception as e:
-                    st.error(f"Ошибка при выполнении объединения: {str(e)}")
-                    logger.exception("Ошибка в Power Query merge")
-        else:
-            st.warning("Добавьте хотя бы одну операцию объединения")
+                    logger.error(f"Ошибка экспорта всех данных: {e}")
+                    st.error(f"Ошибка при экспорте: {str(e)}")
+    
+    def build_full_export_query(self, selected_columns: List[str]) -> str:
+        """
+        Построение SQL-запроса для экспорта всех данных
+        """
+        # Парсим выбранные столбцы на таблицу и имя столбца
+        parsed_cols = []
+        tables_used = set()
+        
+        for col in selected_columns:
+            table, column = col.split('.', 1)
+            parsed_cols.append((table, column))
+            tables_used.add(table)
+        
+        # Формируем SELECT часть
+        select_parts = [f"{table}.{col} AS \"{table}.{col}\"" for table, col in parsed_cols]
+        
+        # Определяем главную таблицу (берем первую)
+        main_table = list(tables_used)[0] if tables_used else 'parts'
+        
+        # Формируем JOIN части на основе известных связей
+        table_joins = {
+            ('parts', 'oe'): 'cross_references.artikul_norm = parts.artikul_norm AND cross_references.brand_norm = parts.brand_norm',
+            ('oe', 'parts'): 'cross_references.artikul_norm = parts.artikul_norm AND cross_references.brand_norm = parts.brand_norm',
+            ('cross_references', 'oe'): 'cross_references.oe_number_norm = oe.oe_number_norm',
+            ('cross_references', 'parts'): 'cross_references.artikul_norm = parts.artikul_norm AND cross_references.brand_norm = parts.brand_norm',
+            ('prices', 'parts'): 'prices.artikul_norm = parts.artikul_norm AND prices.brand_norm = parts.brand_norm',
+            ('parts', 'prices'): 'prices.artikul_norm = parts.artikul_norm AND prices.brand_norm = parts.brand_norm'
+        }
+        
+        join_parts = []
+        used_tables = {main_table}
+        
+        # Пытаемся соединить все таблицы
+        remaining_tables = set(tables_used) - {main_table}
+        
+        while remaining_tables:
+            added_any = False
+            for table in list(remaining_tables):
+                # Пытаемся найти соединение с уже использованными таблицами
+                for used_table in used_tables:
+                    # Проверяем обе комбинации (t1, t2) и (t2, t1)
+                    if (used_table, table) in table_joins:
+                        join_parts.append(f"LEFT JOIN {table} ON {table_joins[(used_table, table)]}")
+                        used_tables.add(table)
+                        remaining_tables.remove(table)
+                        added_any = True
+                        break
+                    elif (table, used_table) in table_joins:
+                        join_parts.append(f"LEFT JOIN {table} ON {table_joins[(table, used_table)]}")
+                        used_tables.add(table)
+                        remaining_tables.remove(table)
+                        added_any = True
+                        break
+            
+            if not added_any:
+                # Если не можем соединить оставшиеся таблицы, используем CROSS JOIN
+                # (это может привести к декартовому произведению, но позволит получить данные)
+                for table in remaining_tables:
+                    join_parts.append(f"CROSS JOIN {table}")
+                break
+        
+        query = f"""
+        SELECT {', '.join(select_parts)}
+        FROM {main_table}
+        {' '.join(join_parts)}
+        """
+        
+        return query
 
+
+# ========================================================================
+# ОСНОВНОЕ ПРИЛОЖЕНИЕ STREAMLIT
+# ========================================================================
 
 def main():
     st.set_page_config(
@@ -2052,46 +2105,41 @@ def main():
     catalog = get_high_volume_catalog()
     
     # Боковая панель навигации
-    st.sidebar.title("Навигация")
+    st.sidebar.header("Навигация")
     page = st.sidebar.radio(
         "Выберите раздел:",
         [
-            "Главная",
-            "📊 Статистика", 
+            "📊 Статистика",
             "📤 Экспорт данных",
-            "📥 Загрузка данных",
-            "🔗 Power Query мердж",
-            "🔧 Управление данными"
+            "📥 Экспорт всех данных",
+            "🔗 Power Query стиль",
+            "🔧 Управление данными",
+            "💰 Цены и наценки",
+            "🚫 Исключения",
+            "🗂️ Категории",
+            "☁️ Облако"
         ]
     )
     
-    if page == "Главная":
-        st.header("Главная")
-        st.info("Добро пожаловать в систему управления каталогом автозапчастей!")
-        st.write("Используйте боковое меню для навигации по разделам.")
-        
-        # Краткая статистика
-        stats = catalog.get_statistics()
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Товаров", f"{stats.get('unique_parts', 0):,}")
-        col2.metric("Брендов", f"{stats.get('brands', 0):,}")
-        col3.metric("OE записей", f"{stats.get('oe', 0):,}")
-        col4.metric("Средняя цена", f"{stats.get('avg_price', 0):,.2f} ₽")
-    
-    elif page == "📊 Статистика":
+    # Отображение выбранной страницы
+    if page == "📊 Статистика":
         catalog.show_statistics()
-    
     elif page == "📤 Экспорт данных":
         catalog.show_export_interface()
-    
-    elif page == "📥 Загрузка данных":
-        catalog.show_upload_interface()
-    
-    elif page == "🔗 Power Query мердж":
-        show_power_query_interface(catalog)
-    
+    elif page == "📥 Экспорт всех данных":
+        catalog.show_full_export_interface()
+    elif page == "🔗 Power Query стиль":
+        catalog.show_power_query_interface()
     elif page == "🔧 Управление данными":
         catalog.show_data_management()
+    elif page == "💰 Цены и наценки":
+        catalog.show_price_settings()
+    elif page == "🚫 Исключения":
+        catalog.show_exclusion_settings()
+    elif page == "🗂️ Категории":
+        catalog.show_category_mapping()
+    elif page == "☁️ Облако":
+        catalog.show_cloud_sync()
 
 
 if __name__ == "__main__":
