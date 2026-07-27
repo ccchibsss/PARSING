@@ -1,13 +1,14 @@
 # ============================================================================
-# БЛОК 11: HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ПОЛНАЯ ВЕРСИЯ v100.22)
+# БЛОК 11: HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ПОЛНАЯ ВЕРСИЯ v100.23)
 # ============================================================================
-# ✅ НОВОЕ v100.22:
-# 1. VLOOKUP-style парсинг столбцов с гибким выбором
-# 2. Power Query подобные трансформации данных
-# 3. Визуальный конструктор запросов
-# 4. Профили парсинга
-# 5. Маппинг колонок с машинным обучением
-# 6. Пакетная обработка с разными правилами
+# ✅ НОВОЕ v100.22/v100.23:
+# 1. VLOOKUP-style парсинг столбцов с гибким выбором (СОХРАНЕНО ПОЛНОСТЬЮ)
+# 2. Power Query подобные трансформации данных (СОХРАНЕНО ПОЛНОСТЬЮ)
+# 3. Визуальный конструктор запросов (СОХРАНЕНО ПОЛНОСТЬЮ)
+# 4. Профили парсинга (СОХРАНЕНО ПОЛНОСТЬЮ)
+# 5. Маппинг колонок (СОХРАНЕНО ПОЛНОСТЬЮ)
+# 6. Пакетная обработка с разными правилами (СОХРАНЕНО ПОЛНОСТЬЮ)
+# 7. ✅ НОВОЕ v100.23: Истинный потоковый экспорт (DuckDB COPY + Chunked Excel)
 # ============================================================================
 
 import streamlit as st
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 # Константы
 EXCEL_ROW_LIMIT = 1_048_576
+CHUNK_SIZE = 100_000
 
 # ============================================================================
 # POWER QUERY ПОДОБНЫЕ ТРАНСФОРМАЦИИ
@@ -1536,6 +1538,71 @@ class HighVolumeAutoPartsCatalog:
         """
         
         return "\n".join([line.rstrip() for line in query.strip().splitlines()])
+
+    # ========================================================================
+    # ✅ НОВОЕ v100.23: ПОТОКОВЫЙ ЭКСПОРТ (БЕЗ ЗАГРУЗКИ В RAM)
+    # ========================================================================
+    def export_streaming_csv(self, query: str, output_path: str) -> bool:
+        """Использует нативный COPY DuckDB для потоковой записи на диск без загрузки в RAM"""
+        try:
+            abs_path = Path(output_path).resolve()
+            # DuckDB COPY оптимизирован и пишет потоково прямо на диск
+            self.conn.execute(f"COPY ({query}) TO '{abs_path}' (HEADER, DELIMITER ';')")
+            return True
+        except Exception as e:
+            logger.error(f"CSV Export Error: {e}")
+            st.error(f"Ошибка экспорта CSV: {e}")
+            return False
+
+    def export_streaming_excel(self, query: str, output_path: str) -> bool:
+        """Чанковая запись в Excel для предотвращения OOM (Out Of Memory)"""
+        try:
+            abs_path = Path(output_path).resolve()
+            count_query = f"SELECT COUNT(*) FROM ({query})"
+            total_rows = self.conn.execute(count_query).fetchone()[0]
+            
+            if total_rows == 0:
+                st.warning("Нет данных для экспорта.")
+                return False
+
+            if total_rows > EXCEL_ROW_LIMIT:
+                st.warning(f"Внимание: Excel имеет лимит ~{EXCEL_ROW_LIMIT} строк. Будет экспортировано только первые {EXCEL_ROW_LIMIT} строк. Для полных данных используйте CSV.")
+                query = f"{query} LIMIT {EXCEL_ROW_LIMIT}"
+                total_rows = EXCEL_ROW_LIMIT
+
+            progress_bar = st.progress(0, text="Потоковая запись Excel...")
+            
+            # Используем fetchmany для чанковой загрузки из DuckDB
+            rel = self.conn.execute(query)
+            first_chunk = True
+            rows_written = 0
+            
+            with pd.ExcelWriter(abs_path, engine='openpyxl') as writer:
+                while True:
+                    chunk = rel.fetchmany(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    
+                    col_names = [desc[0] for desc in rel.description]
+                    df_chunk = pd.DataFrame(chunk, columns=col_names)
+                    
+                    df_chunk.to_excel(
+                        writer, 
+                        sheet_name='Данные', 
+                        index=False, 
+                        header=first_chunk, 
+                        startrow=rows_written if not first_chunk else 0
+                    )
+                    rows_written += len(df_chunk)
+                    first_chunk = False
+                    progress_bar.progress(min(1.0, rows_written / total_rows))
+            
+            progress_bar.empty()
+            return True
+        except Exception as e:
+            logger.error(f"Excel Export Error: {e}")
+            st.error(f"Ошибка экспорта Excel: {e}")
+            return False
     
     def export_to_csv_optimized(self, output_path: str, selected_columns: Optional[List[str]] = None, include_prices: bool = True, apply_markup: bool = True) -> bool:
         total = self.conn.execute(
@@ -1722,22 +1789,39 @@ class HighVolumeAutoPartsCatalog:
         include_prices = st.checkbox("Включить цены", value=True)
         apply_markup = st.checkbox("Применить наценку", value=True, disabled=not include_prices)
         
+        # ✅ НОВОЕ: Выбор режима экспорта для больших файлов
+        use_streaming = st.checkbox(
+            "⚡ Использовать потоковый экспорт (Рекомендуется для файлов > 100 000 строк, экономит RAM)", 
+            value=True
+        )
+        
         if st.button("🚀 Экспортировать"):
             output_path = self.data_dir / f"export.{format_choice.lower()}"
             
             with st.spinner("Генерация файла..."):
                 if format_choice == "CSV":
-                    self.export_to_csv_optimized(str(output_path), selected_columns if selected_columns else None, include_prices, apply_markup)
+                    if use_streaming:
+                        query = self.build_export_query(selected_columns if selected_columns else None, include_prices, apply_markup)
+                        success = self.export_streaming_csv(query, str(output_path))
+                    else:
+                        success = self.export_to_csv_optimized(str(output_path), selected_columns if selected_columns else None, include_prices, apply_markup)
+                        
                 elif format_choice == "Excel":
-                    self.export_to_excel_optimized(str(output_path), selected_columns if selected_columns else None, include_prices, apply_markup)
+                    if use_streaming:
+                        query = self.build_export_query(selected_columns if selected_columns else None, include_prices, apply_markup)
+                        success = self.export_streaming_excel(query, str(output_path))
+                    else:
+                        success = self.export_to_excel_optimized(str(output_path), selected_columns if selected_columns else None, include_prices, apply_markup)
+                        
                 elif format_choice == "Parquet":
-                    self.export_to_parquet(str(output_path), selected_columns if selected_columns else None, include_prices, apply_markup)
+                    success = self.export_to_parquet(str(output_path), selected_columns if selected_columns else None, include_prices, apply_markup)
                 else:
                     st.warning("Неподдерживаемый формат")
                     return
             
-            with open(output_path, "rb") as f:
-                st.download_button("⬇️ Скачать файл", f, file_name=output_path.name)
+            if success:
+                with open(output_path, "rb") as f:
+                    st.download_button("⬇️ Скачать файл", f, file_name=output_path.name)
     
     def show_price_settings(self):
         st.header("💰 Управление ценами и наценками")
