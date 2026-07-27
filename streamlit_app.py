@@ -1732,6 +1732,37 @@ class HighVolumeAutoPartsCatalog:
                     st.rerun()
     
     # ========================================================================
+    # НОВЫЙ ФУНКЦИОНАЛ: ЗАГРУЗКА ФАЙЛОВ
+    # ========================================================================
+    def show_upload_interface(self):
+        st.header("📥 Загрузка данных")
+        
+        uploaded_files = st.file_uploader(
+            "Выберите Excel файлы для загрузки",
+            type=['xlsx', 'xls'],
+            accept_multiple_files=True
+        )
+        
+        if uploaded_files:
+            file_paths = {}
+            for uploaded_file in uploaded_files:
+                file_path = self.data_dir / uploaded_file.name
+                with open(file_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                file_paths[uploaded_file.name] = str(file_path)
+            
+            st.success(f"Загружено {len(uploaded_files)} файлов")
+            
+            if st.button("🚀 Обработать и загрузить в базу"):
+                with st.spinner("Обработка файлов..."):
+                    dataframes = self.merge_all_data_parallel(file_paths)
+                    if dataframes:
+                        self.process_and_load_data(dataframes)
+                        st.success("Данные успешно загружены в базу")
+                    else:
+                        st.error("Не удалось обработать файлы")
+
+    # ========================================================================
     # НОВЫЙ ФУНКЦИОНАЛ: POWER QUERY-СТИЛЬ МЕРДЖА
     # ========================================================================
     def get_all_table_names(self) -> List[str]:
@@ -2028,6 +2059,7 @@ def main():
             "Главная",
             "📊 Статистика", 
             "📤 Экспорт данных",
+            "📥 Загрузка данных",
             "🔗 Power Query мердж",
             "🔧 Управление данными"
         ]
@@ -2051,6 +2083,9 @@ def main():
     
     elif page == "📤 Экспорт данных":
         catalog.show_export_interface()
+    
+    elif page == "📥 Загрузка данных":
+        catalog.show_upload_interface()
     
     elif page == "🔗 Power Query мердж":
         show_power_query_interface(catalog)
