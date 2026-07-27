@@ -1,4 +1,3 @@
-# app.py (ПОЛНАЯ ИСПРАВЛЕННАЯ ВЕРСИЯ)
 import os
 import sys
 import json
@@ -18,7 +17,7 @@ import polars as pl
 import pandas as pd
 
 # ============================================================================
-# НАСТРОЙКА ЛОГИРОВАНИЯ (Исправлено: добавлен вывод в консоль Streamlit)
+# НАСТРОЙКА ЛОГИРОВАНИЯ
 # ============================================================================
 log_dir = Path("./auto_parts_data")
 log_dir.mkdir(exist_ok=True)
@@ -27,7 +26,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(log_dir / "app.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout) # ДОБАВЛЕНО: Вывод в консоль сервера
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
@@ -37,7 +36,7 @@ EXCEL_ROW_LIMIT = 1048575
 
 
 # ============================================================================
-# БЛОК 11: HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ПОЛНАЯ ВЕРСИЯ v100.21)
+# БЛОК 11: HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ПОЛНАЯ ВЕРСИЯ v100.22)
 # ============================================================================
 class HighVolumeAutoPartsCatalog:
     def __init__(self):
@@ -227,7 +226,8 @@ class HighVolumeAutoPartsCatalog:
         self.create_indexes()
     
     def create_indexes(self):
-        st.info("⚙️ Создание индексов для ускорения поиска...")
+        # ЗАМЕНА: st.info/st.success заменены на logger.info для безопасности вне UI-контекста
+        logger.info("⚙️ Создание индексов для ускорения поиска...")
         indexes = [
             "CREATE INDEX IF NOT EXISTS idx_oe_number_norm ON oe(oe_number_norm)",
             "CREATE INDEX IF NOT EXISTS idx_parts_keys ON parts(artikul_norm, brand_norm)",
@@ -242,7 +242,17 @@ class HighVolumeAutoPartsCatalog:
             except Exception as e:
                 logger.warning(f"Не удалось создать индекс: {e}")
         
-        st.success("🛠️ Индексы созданы.")
+        # ВНЕДРЕНИЕ ПОЛНОТЕКСТОВОГО ПОИСКА (FTS)
+        try:
+            self.conn.execute("INSTALL fts;")
+            self.conn.execute("LOAD fts;")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_parts_fts ON parts USING FTS(artikul_norm, brand_norm);")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_oe_fts ON oe USING FTS(oe_number_norm, name);")
+            logger.info("✅ Индексы полнотекстового поиска (FTS) успешно созданы.")
+        except Exception as e:
+            logger.warning(f"Не удалось инициализировать FTS (возможно, отсутствует доступ к сети для INSTALL): {e}. Будет использоваться резервный поиск.")
+        
+        logger.info("🛠️ Индексы созданы.")
     
     # ========================================================================
     # НОРМАЛИЗАЦИЯ И ОЧИСТКА
@@ -301,7 +311,7 @@ class HighVolumeAutoPartsCatalog:
         return categorization_expr.otherwise(pl.lit('Разное')).alias('category')
     
     # ========================================================================
-    # ✅ УНИВЕРСАЛЬНАЯ КОНВЕРТАЦИЯ В ЧИСЛО (ИСПРАВЛЕНИЕ ДАТ v100.20)
+    # УНИВЕРСАЛЬНАЯ КОНВЕРТАЦИЯ В ЧИСЛО
     # ========================================================================
     @staticmethod
     def safe_convert_to_float(value: Any) -> float:
@@ -370,7 +380,7 @@ class HighVolumeAutoPartsCatalog:
             return 0.0
     
     # ========================================================================
-    # ✅ ОБРАБОТКА ФАЙЛОВ (ПОЛНОСТЬЮ ПЕРЕПИСАНА И ИСПРАВЛЕНА)
+    # ОБРАБОТКА ФАЙЛОВ
     # ========================================================================
     def detect_columns(self, actual_columns: List[str], expected_columns: List[str]) -> Dict[str, str]:
         column_variants = {
@@ -435,7 +445,15 @@ class HighVolumeAutoPartsCatalog:
                 logger.error(f"Файл не найден: {file_path}")
                 return pl.DataFrame()
             
-            df = pl.read_excel(file_path, engine='calamine')
+            # АВТОМАТИЧЕСКОЕ ОПРЕДЕЛЕНИЕ ФОРМАТА ФАЙЛА
+            file_ext = Path(file_path).suffix.lower()
+            if file_ext == '.csv':
+                df = pl.read_csv(file_path, ignore_errors=True, encoding='utf-8')
+            elif file_ext in ['.xlsx', '.xls']:
+                df = pl.read_excel(file_path, engine='calamine')
+            else:
+                logger.error(f"Неподдерживаемый формат файла: {file_ext}. Ожидались .csv, .xlsx, .xls")
+                return pl.DataFrame()
             
             if df.is_empty():
                 logger.warning(f"Пустой файл: {file_path}")
@@ -500,22 +518,18 @@ class HighVolumeAutoPartsCatalog:
             if col in df.columns:
                 df = df.with_columns(self.clean_values(pl.col(col)).alias(col))
         
-        # ====================================================================
-        # ✅ ПОЛНОСТЬЮ ИСПРАВЛЕННЫЙ БЛОК КОНВЕРТАЦИИ ЧИСЕЛ (через Polars)
-        # ====================================================================
         numeric_cols = ['length', 'width', 'height', 'weight', 'price']
         for col in numeric_cols:
             if col in df.columns:
                 try:
-                    # Polars работает с колонками, а не с циклом Python. Это исключает ошибки типов.
                     df = df.with_columns(
                         pl.col(col)
-                        .cast(pl.Utf8)                                      # В строку
-                        .str.replace_all(r'[^\d.,\-]', '')                   # Удаляем все символы кроме цифр, точек, запятых и минуса
-                        .str.replace(',', '.')                              # Заменяем запятую на точку
-                        .str.replace(r'\.(?=.*\.)', '')                     # Оставляем только последнюю точку (убираем лишние)
-                        .cast(pl.Float64, strict=False)                     # Конвертируем в число. Невалидное становится null
-                        .fill_null(0.0)                                     # Null превращаем в 0.0
+                        .cast(pl.Utf8)
+                        .str.replace_all(r'[^\d.,\-]', '')
+                        .str.replace(',', '.')
+                        .str.replace(r'\.(?=.*\.)', '')
+                        .cast(pl.Float64, strict=False)
+                        .fill_null(0.0)
                         .round(2)
                         .alias(col)
                     )
@@ -526,7 +540,6 @@ class HighVolumeAutoPartsCatalog:
                         df = df.with_columns(pl.lit(0.0).cast(pl.Float64).alias(col))
                     except Exception:
                         pass
-        # ====================================================================
         
         key_cols = [col for col in ['oe_number', 'artikul', 'brand'] if col in df.columns]
         if key_cols:
@@ -542,10 +555,6 @@ class HighVolumeAutoPartsCatalog:
         return df
 
     def process_uploaded_files(self, uploaded_files_dict: Dict[str, Any]) -> Dict[str, pl.DataFrame]:
-        """
-        Обрабатывает файлы, загруженные через st.file_uploader.
-        Сохраняет их во временную папку, обрабатывает и удаляет.
-        """
         results = {}
         temp_dir = self.data_dir / "temp_uploads"
         temp_dir.mkdir(exist_ok=True)
@@ -560,9 +569,6 @@ class HighVolumeAutoPartsCatalog:
                 with open(temp_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
                 
-                # ====================================================================
-                # ✅ ОБРАБОТКА С ВЫВОДОМ ТОЧНОЙ ОШИБКИ В ИНТЕРФЕЙС
-                # ====================================================================
                 try:
                     df = self.read_and_prepare_file(str(temp_path), file_type)
                     if not df.is_empty():
@@ -571,10 +577,8 @@ class HighVolumeAutoPartsCatalog:
                     else:
                         logger.warning(f"⚠️ Файл '{uploaded_file.name}' обработан, но DataFrame пуст.")
                 except Exception as e:
-                    # Выводим ошибку прямо на экран, чтобы пользователь знал, что делать
                     st.error(f"❌ Критическая ошибка при обработке файла '{uploaded_file.name}': {str(e)}")
                     logger.exception(f"Ошибка обработки файла {uploaded_file.name}")
-                # ====================================================================
                 
                 try:
                     temp_path.unlink()
@@ -587,7 +591,7 @@ class HighVolumeAutoPartsCatalog:
         return results
 
     # ========================================================================
-    # ✅ ЗАГРУЗКА И ОБНОВЛЕНИЕ В БАЗЕ
+    # ЗАГРУЗКА И ОБНОВЛЕНИЕ В БАЗЕ
     # ========================================================================
     def upsert_data(self, table_name: str, df: pl.DataFrame, pk: List[str]):
         if df.is_empty():
@@ -603,22 +607,14 @@ class HighVolumeAutoPartsCatalog:
             return
         
         try:
-            pk_list = pk
-            pk_cols_csv = ", ".join(f'"{c}"' for c in pk_list)
-            
-            delete_sql = f"""
-                DELETE FROM {table_name}
-                WHERE ({pk_cols_csv}) IN (SELECT {pk_cols_csv} FROM {temp_view_name});
-            """
-            self.conn.execute(delete_sql)
-            
+            # НАТИВНЫЙ UPSERT: Используем атомарный INSERT OR REPLACE, так как в таблицах определены PRIMARY KEY.
+            # Это заменяет небезопасную связку DELETE + INSERT и работает значительно быстрее.
             insert_sql = f"""
-                INSERT INTO {table_name}
+                INSERT OR REPLACE INTO {table_name}
                 SELECT * FROM {temp_view_name};
             """
             self.conn.execute(insert_sql)
-            
-            logger.info(f"Успешно upsert {len(df)} записей в таблицу {table_name}.")
+            logger.info(f"Успешно upsert {len(df)} записей в таблицу {table_name} (INSERT OR REPLACE).")
         
         except Exception as e:
             logger.error(f"Ошибка при UPSERT в {table_name}: {e}")
@@ -847,8 +843,8 @@ class HighVolumeAutoPartsCatalog:
             parts_df = parts_df.with_columns(
                 description=pl.concat_str([
                     pl.lit('Артикул: '), pl.col('_artikul_str'),
-                    pl.lit(', Бренд: '), pl.col('_brand_str'),
-                    pl.lit(', Кратность: '), pl.col('_multiplicity_str'), pl.lit(' шт.')
+                    pl.lit('Бренд: '), pl.col('_brand_str'),
+                    pl.lit('Кратность: '), pl.col('_multiplicity_str'), pl.lit(' шт.')
                 ], separator='')
             )
             
@@ -1214,7 +1210,15 @@ class HighVolumeAutoPartsCatalog:
             return False
         
         query = self.build_export_query(selected_columns, include_prices, apply_markup)
-        df = pd.read_sql(query, self.conn)
+        
+        # ИСПРАВЛЕНИЕ: Замена pd.read_sql на нативный DuckDB -> Polars -> Pandas.
+        # Это исключает ошибки совместимости драйверов SQLAlchemy с DuckDB.
+        try:
+            df = self.conn.execute(query).pl().to_pandas()
+        except Exception as e:
+            logger.exception("Ошибка выполнения запроса для Excel")
+            st.error(f"Ошибка при формировании данных для Excel: {str(e)}")
+            return False
         
         dimension_cols = ["Длинна", "Ширина", "Высота", "Вес"]
         for col in dimension_cols:
@@ -1681,13 +1685,47 @@ class HighVolumeAutoPartsCatalog:
                     st.rerun()
     
     def search_parts(self, query: str, limit: int = 100) -> pd.DataFrame:
-        """Поиск товаров по артикулу, бренду или OE номеру"""
-        if not query:
+        """Поиск товаров по артикулу, бренду или OE номеру с использованием FTS"""
+        if not query or not query.strip():
             return pd.DataFrame()
         
-        query_norm = self.normalize_key(pl.Series([query]))[0]
+        # Очищаем запрос для FTS: убираем спецсимволы, оставляем слова
+        clean_query = re.sub(r'[^\w\s]', ' ', query).strip()
+        if not clean_query:
+            return pd.DataFrame()
         
-        sql = f"""
+        # Попытка использовать полнотекстовый поиск (FTS) через оператор MATCH
+        sql_fts = f"""
+            SELECT DISTINCT
+                p.artikul,
+                p.brand,
+                p.multiplicity,
+                p.length,
+                p.width,
+                p.height,
+                p.weight,
+                STRING_AGG(DISTINCT o.oe_number, ', ') as oe_numbers
+            FROM parts p
+            LEFT JOIN cross_references cr ON p.artikul_norm = cr.artikul_norm AND p.brand_norm = cr.brand_norm
+            LEFT JOIN oe o ON cr.oe_number_norm = o.oe_number_norm
+            WHERE 
+                p.artikul_norm MATCH ?
+                OR p.brand_norm MATCH ?
+                OR o.oe_number_norm MATCH ?
+            GROUP BY p.artikul, p.brand, p.multiplicity, p.length, p.width, p.height, p.weight
+            LIMIT {limit}
+        """
+        
+        try:
+            df = self.conn.execute(sql_fts, [clean_query, clean_query, clean_query]).pl().to_pandas()
+            if not df.empty:
+                return df
+        except Exception as e:
+            logger.warning(f"FTS поиск не удался ({e}), используем резервный LIKE поиск.")
+        
+        # Резервный поиск на случай, если FTS не инициализировался или не нашел точных совпадений по словам
+        query_norm = self.normalize_key(pl.Series([query]))[0]
+        sql_fallback = f"""
             SELECT DISTINCT
                 p.artikul,
                 p.brand,
@@ -1709,10 +1747,9 @@ class HighVolumeAutoPartsCatalog:
         """
         
         try:
-            df = pd.read_sql(sql, self.conn)
-            return df
+            return self.conn.execute(sql_fallback).pl().to_pandas()
         except Exception as e:
-            logger.error(f"Ошибка поиска: {e}")
+            logger.error(f"Ошибка резервного поиска: {e}")
             return pd.DataFrame()
 
 
@@ -1733,7 +1770,7 @@ def main():
         initial_sidebar_state="expanded"
     )
     
-    st.title("🔧 Каталог автозапчастей v100.21")
+    st.title("🔧 Каталог автозапчастей v100.22")
     
     # Инициализация каталога
     catalog = get_high_volume_catalog()
