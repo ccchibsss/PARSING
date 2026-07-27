@@ -1,8 +1,6 @@
 # streamlit_app.py
 # ============================================================================
-# ПРОФЕССИОНАЛЬНЫЙ КАТАЛОГ АВТОЗАПЧАСТЕЙ v2.1
-# ============================================================================
-# ОБЪЕДИНЕНИЕ: первый файл (основной) + недостающие методы из второго
+# ПРОФЕССИОНАЛЬНЫЙ КАТАЛОГ АВТОЗАПЧАСТЕЙ v2.1 (ОБЪЕДИНЕННАЯ ВЕРСИЯ)
 # ============================================================================
 
 import streamlit as st
@@ -265,7 +263,6 @@ class HighVolumeAutoPartsCatalog:
                 self.conn.execute(index_sql)
             except Exception as e:
                 logger.warning(f"Не удалось создать индекс: {e}")
-                # Не прекращаем выполнение, если один индекс не создался
         st.success("🛠️ Индексы созданы.")
     
     # ========================================================================
@@ -335,6 +332,7 @@ class HighVolumeAutoPartsCatalog:
         """
         Конвертирует значение в float.
         Возвращает кортеж: (результат, сообщение об ошибке или None).
+        Исправляет проблему с датами в габаритах (Excel serial number).
         """
         if value is None or value == "":
             return 0.0, None
@@ -424,7 +422,6 @@ class HighVolumeAutoPartsCatalog:
         """
         Эвристическое сопоставление фактических колонок файла с системными полями.
         Возвращает маппинг: {фактическая_колонка: системное_поле}.
-        Используется как предзаполнение для интерактивного маппинга.
         """
         column_variants = {
             'oe_number': ['oe номер', 'oe', 'оe', 'номер', 'code', 'oe_number', 'oe number',
@@ -502,18 +499,10 @@ class HighVolumeAutoPartsCatalog:
                               column_mapping: Optional[Dict[str, str]] = None) -> pl.DataFrame:
         """
         Читает файл, применяет маппинг колонок, нормализует ключи,
-        конвертирует числа и формирует столбец _validation_errors
-        с описанием всех проблем валидации по каждой строке.
-        
-        Args:
-            file_path: путь к файлу
-            file_type: тип файла (oe, cross, prices, dimensions, barcode, images, universal)
-            column_mapping: явный маппинг {фактическая_колонка: системное_поле}.
-                            Если None — используется эвристика detect_columns.
+        конвертирует числа и формирует столбец _validation_errors.
         """
         logger.info(f"Обработка файла: {file_type} ({file_path})")
         
-        # Проверка расширения файла
         file_ext = Path(file_path).suffix.lower()
         if file_ext not in ['.xlsx', '.xls', '.csv']:
             logger.error(f"Неподдерживаемый тип файла: {file_ext}")
@@ -524,7 +513,7 @@ class HighVolumeAutoPartsCatalog:
                 logger.error(f"Файл не найден: {file_path}")
                 return pl.DataFrame()
             
-            df = pl.read_excel(file_path, engine='calamine') # Используем fastexcel под капотом
+            df = pl.read_excel(file_path, engine='calamine')
             
             if df.is_empty():
                 logger.warning(f"Пустой файл: {file_path}")
@@ -536,7 +525,6 @@ class HighVolumeAutoPartsCatalog:
             logger.exception(f"Ошибка чтения файла {file_path}: {e}")
             return pl.DataFrame()
         
-        # Ожидаемые системные поля для каждого типа файла
         schemas = {
             'oe': ['oe_number', 'artikul', 'brand', 'name', 'applicability',
                    'length', 'width', 'height', 'weight', 'dimensions_str', 'price', 'currency'],
@@ -552,7 +540,6 @@ class HighVolumeAutoPartsCatalog:
         
         expected_cols = schemas.get(file_type, [])
         
-        # Если маппинг не передан (массовая загрузка) — используем эвристику
         if column_mapping is None:
             column_mapping = self.detect_columns(df.columns, expected_cols)
         
@@ -562,7 +549,6 @@ class HighVolumeAutoPartsCatalog:
         
         logger.info(f"Маппинг колонок для {file_type}: {column_mapping}")
         
-        # Переименование колонок согласно маппингу
         try:
             df = df.rename(column_mapping)
         except Exception as e:
@@ -574,7 +560,6 @@ class HighVolumeAutoPartsCatalog:
                 except Exception as e2:
                     logger.warning(f"Не удалось переименовать {old_name} → {new_name}: {e2}")
         
-        # Удаление дубликатов колонок (оставляем первое вхождение)
         if len(df.columns) != len(set(df.columns)):
             seen = set()
             cols_to_keep = []
@@ -584,12 +569,10 @@ class HighVolumeAutoPartsCatalog:
                     cols_to_keep.append(col)
             df = df.select(cols_to_keep)
         
-        # Очистка ключевых полей от мусорных символов
         for col in ['artikul', 'brand', 'oe_number']:
             if col in df.columns:
                 df = df.with_columns(self.clean_values(pl.col(col)).alias(col))
         
-        # Конвертация числовых колонок с фиксацией ошибок валидации
         numeric_cols = ['length', 'width', 'height', 'weight', 'price']
         row_errors: List[List[str]] = [[] for _ in range(len(df))]
         
@@ -604,16 +587,13 @@ class HighVolumeAutoPartsCatalog:
                         row_errors[idx].append(f"{col}: {err}")
                 df = df.with_columns(pl.Series(converted).alias(col))
         
-        # Формирование единого столбца с ошибками валидации
         error_strings = [" | ".join(errs) for errs in row_errors]
         df = df.with_columns(pl.Series("_validation_errors", error_strings))
         
-        # Удаление дубликатов строк по ключевым колонкам
         key_cols = [col for col in ['oe_number', 'artikul', 'brand'] if col in df.columns]
         if key_cols:
             df = df.unique(subset=key_cols, keep='first')
         
-        # Нормализация ключей для точного поиска и связывания
         for col in ['artikul', 'brand', 'oe_number']:
             if col in df.columns:
                 df = df.with_columns(self.normalize_key(pl.col(col)).alias(f"{col}_norm"))
@@ -627,12 +607,11 @@ class HighVolumeAutoPartsCatalog:
     def upsert_data(self, table_name: str, df: pl.DataFrame, pk: List[str]):
         """
         Потокобезопасный UPSERT: удаляет существующие записи по первичному ключу
-        и вставляет новые. Все операции выполняются под блокировкой db_lock.
+        и вставляет новые с явным указанием колонок (защита от "10 columns but 5 values").
         """
         if df.is_empty():
             return
         
-        # Служебный столбец валидации не должен попадать в базу
         if "_validation_errors" in df.columns:
             df = df.drop("_validation_errors")
         
@@ -650,14 +629,12 @@ class HighVolumeAutoPartsCatalog:
                 pk_cols_csv = ", ".join(f'"{c}"' for c in pk)
                 all_cols_csv = ", ".join(f'"{c}"' for c in df.columns)
                 
-                # Удаляем существующие записи по первичному ключу
                 delete_sql = f"""
                     DELETE FROM {table_name}
                     WHERE ({pk_cols_csv}) IN (SELECT {pk_cols_csv} FROM {temp_view_name});
                 """
                 self.conn.execute(delete_sql)
                 
-                # Вставляем новые записи с явным указанием колонок
                 insert_sql = f"""
                     INSERT INTO {table_name} ({all_cols_csv})
                     SELECT {all_cols_csv} FROM {temp_view_name};
@@ -693,13 +670,11 @@ class HighVolumeAutoPartsCatalog:
             if 'price' not in price_df.columns:
                 price_df = price_df.with_columns(pl.lit(0.0).alias('price'))
             
-            # Фильтрация по заданным границам цен
             price_df = price_df.filter(
                 (pl.col('price') >= self.price_rules['min_price']) &
                 (pl.col('price') <= self.price_rules['max_price'])
             )
             
-            # Оставляем только колонки, соответствующие схеме таблицы prices
             price_df = price_df.select(['artikul_norm', 'brand_norm', 'price', 'currency'])
             self.upsert_data('prices', price_df, ['artikul_norm', 'brand_norm'])
     
@@ -708,11 +683,7 @@ class HighVolumeAutoPartsCatalog:
     # ========================================================================
     def process_and_load_data(self, dataframes: Dict[str, pl.DataFrame]):
         """
-        Оркестрация загрузки всех типов данных в базу:
-        1. OE-данные (с категоризацией и извлечением кроссов)
-        2. Кросс-референсы
-        3. Цены
-        4. Сборка таблицы parts из OE, габаритов, штрихкодов и изображений
+        Оркестрация загрузки всех типов данных в базу.
         """
         st.info("🔄 Начало загрузки и обновления данных в базе...")
         
@@ -722,9 +693,7 @@ class HighVolumeAutoPartsCatalog:
         progress_bar = st.progress(0, text="Подготовка к обновлению базы данных...")
         step_counter = 0
         
-        # ------------------------------------------------------------------
         # 1. Обработка OE-данных
-        # ------------------------------------------------------------------
         if 'oe' in dataframes:
             step_counter += 1
             progress_bar.progress(step_counter / (num_steps + 1),
@@ -733,7 +702,6 @@ class HighVolumeAutoPartsCatalog:
             df = dataframes['oe'].filter(pl.col('oe_number_norm') != "")
             
             # ГАРАНТИРОВАННОЕ ДОБАВЛЕНИЕ ВСЕХ НЕОБХОДИМЫХ КОЛОНОК ПЕРЕД SELECT
-            # Это предотвращает polars.exceptions.ColumnNotFoundError
             required_oe_cols = {
                 'oe_number': pl.lit("").cast(pl.Utf8),
                 'name': pl.lit("").cast(pl.Utf8),
@@ -749,13 +717,11 @@ class HighVolumeAutoPartsCatalog:
                 if col not in df.columns:
                     df = df.with_columns(default_expr.alias(col))
             
-            # Теперь select безопасен на 100%
             oe_df = df.select([
                 'oe_number_norm', 'oe_number', 'name', 'applicability',
                 'length', 'width', 'height', 'weight', 'dimensions_str'
             ]).unique(subset=['oe_number_norm'], keep='first')
             
-            # Категоризация по названию
             if 'name' in oe_df.columns:
                 oe_df = oe_df.with_columns(
                     self.determine_category_vectorized(pl.col('name')).alias('category')
@@ -770,16 +736,13 @@ class HighVolumeAutoPartsCatalog:
             
             self.upsert_data('oe', oe_df, ['oe_number_norm'])
             
-            # Извлекаем кросс-ссылки из OE-файла (если там есть артикулы)
             if 'artikul_norm' in df.columns and 'brand_norm' in df.columns:
                 cross_df_from_oe = df.filter(pl.col('artikul_norm') != "").select(
                     ['oe_number_norm', 'artikul_norm', 'brand_norm']).unique()
                 self.upsert_data('cross_references', cross_df_from_oe, [
                     'oe_number_norm', 'artikul_norm', 'brand_norm'])
         
-        # ------------------------------------------------------------------
         # 2. Обработка кросс-референсов
-        # ------------------------------------------------------------------
         if 'cross' in dataframes:
             step_counter += 1
             progress_bar.progress(step_counter / (num_steps + 1),
@@ -787,7 +750,6 @@ class HighVolumeAutoPartsCatalog:
             
             df = dataframes['cross']
             
-            # Гарантируем наличие ключей для фильтрации и выбора
             for col in ['oe_number_norm', 'artikul_norm', 'brand_norm']:
                 if col not in df.columns:
                     df = df.with_columns(pl.lit("").cast(pl.Utf8).alias(col))
@@ -799,9 +761,7 @@ class HighVolumeAutoPartsCatalog:
             self.upsert_data('cross_references', cross_df_from_cross, [
                 'oe_number_norm', 'artikul_norm', 'brand_norm'])
         
-        # ------------------------------------------------------------------
         # 3. Обработка цен
-        # ------------------------------------------------------------------
         if 'prices' in dataframes:
             price_df = dataframes['prices']
             if not price_df.is_empty():
@@ -809,9 +769,7 @@ class HighVolumeAutoPartsCatalog:
                 self.upsert_prices(price_df)
                 st.success(f"✅ Успешно обновлено {len(price_df)} ценовых записей")
         
-        # ------------------------------------------------------------------
         # 4. Сборка таблицы parts
-        # ------------------------------------------------------------------
         step_counter += 1
         progress_bar.progress(step_counter / (num_steps + 1),
                               text=f"({step_counter}/{num_steps}) Сборка и обновление данных по артикулам...")
@@ -836,7 +794,6 @@ class HighVolumeAutoPartsCatalog:
                 parts_df = pl.DataFrame()
         
         if parts_df is not None and not parts_df.is_empty():
-            # Подтягиваем дополнительные атрибуты из каждого файла по приоритету
             for ftype in file_priority:
                 if ftype not in key_files:
                     continue
@@ -865,13 +822,11 @@ class HighVolumeAutoPartsCatalog:
                 parts_df = parts_df.join(
                     df_subset, on=['artikul_norm', 'brand_norm'], how='left', coalesce=True)
             
-            # Кратность: по умолчанию 1
             if 'multiplicity' not in parts_df.columns:
                 parts_df = parts_df.with_columns(multiplicity=pl.lit(1).cast(pl.Int32))
             else:
                 parts_df = parts_df.with_columns(pl.col('multiplicity').fill_null(1).cast(pl.Int32))
             
-            # Гарантируем наличие размерных колонок
             for col in ['length', 'width', 'height', 'weight']:
                 if col not in parts_df.columns:
                     parts_df = parts_df.with_columns(pl.lit(0.0).cast(pl.Float64).alias(col))
@@ -883,7 +838,6 @@ class HighVolumeAutoPartsCatalog:
             if 'dimensions_str' not in parts_df.columns:
                 parts_df = parts_df.with_columns(dimensions_str=pl.lit(None).cast(pl.Utf8))
             
-            # Формируем dimensions_str из чисел, если он пуст
             parts_df = parts_df.with_columns([
                 pl.col('length').cast(pl.Utf8).fill_null('').alias('_length_str'),
                 pl.col('width').cast(pl.Utf8).fill_null('').alias('_width_str'),
@@ -907,13 +861,11 @@ class HighVolumeAutoPartsCatalog:
             
             parts_df = parts_df.drop(['_length_str', '_width_str', '_height_str'])
             
-            # Гарантируем наличие артикула и бренда
             if 'artikul' not in parts_df.columns:
                 parts_df = parts_df.with_columns(artikul=pl.lit(''))
             if 'brand' not in parts_df.columns:
                 parts_df = parts_df.with_columns(brand=pl.lit(''))
             
-            # Формируем человекочитаемое описание
             parts_df = parts_df.with_columns([
                 pl.col('artikul').cast(pl.Utf8).fill_null('').alias('_artikul_str'),
                 pl.col('brand').cast(pl.Utf8).fill_null('').alias('_brand_str'),
@@ -930,7 +882,6 @@ class HighVolumeAutoPartsCatalog:
             
             parts_df = parts_df.drop(['_artikul_str', '_brand_str', '_multiplicity_str'])
             
-            # Приводим к точной схеме таблицы parts
             final_columns = [
                 'artikul_norm', 'brand_norm', 'artikul', 'brand', 'multiplicity', 'barcode',
                 'length', 'width', 'height', 'weight', 'image_url', 'dimensions_str', 'description'
@@ -949,8 +900,7 @@ class HighVolumeAutoPartsCatalog:
     # ========================================================================
     def _get_brand_markups_sql(self) -> str:
         """
-        БЕЗОПАСНЫЙ способ получения маржинальности брендов.
-        Использует временную таблицу вместо конкатенации строк (защита от SQL-инъекций).
+        БЕЗОПАСНЫЙ способ получения маржинальности брендов через временную таблицу.
         """
         if not self.price_rules.get('brand_markups'):
             return "SELECT NULL::VARCHAR AS brand, NULL::DOUBLE AS markup LIMIT 0"
@@ -1433,7 +1383,7 @@ class HighVolumeAutoPartsCatalog:
         return stats
 
     # ========================================================================
-    # НОВЫЙ МЕТОД: ПАРАЛЛЕЛЬНАЯ ОБРАБОТКА ФАЙЛОВ (из второго файла)
+    # ПАРАЛЛЕЛЬНАЯ ОБРАБОТКА ФАЙЛОВ
     # ========================================================================
     def merge_all_data_parallel(self, file_paths: Dict[str, str], max_workers: int = 4) -> Dict[str, pl.DataFrame]:
         """
@@ -1444,7 +1394,6 @@ class HighVolumeAutoPartsCatalog:
             futures = {}
             for key, path in file_paths.items():
                 if path and os.path.exists(path):
-                    # Проверка расширения файла перед обработкой
                     file_ext = Path(path).suffix.lower()
                     if file_ext in ['.xlsx', '.xls', '.csv']:
                         futures[executor.submit(self.read_and_prepare_file, path, key)] = key
@@ -1836,9 +1785,6 @@ class HighVolumeAutoPartsCatalog:
     def show_data_upload_interface(self):
         """
         Интерактивная загрузка данных с маппингом столбцов в стиле Power Query.
-        Пользователь видит предпросмотр файла, вручную назначает колонки через
-        выпадающие списки и только после этого подтверждает загрузку в базу.
-        Все строки с проблемами валидации выводятся в отдельном отчёте.
         """
         st.header("📥 Загрузка данных")
         st.info("Загрузите Excel/CSV файл. Система автоматически распознает столбцы, "
@@ -1871,14 +1817,12 @@ class HighVolumeAutoPartsCatalog:
                 key=f"upload_{file_type}"
             )
         
-        # Проверка расширения файла
         if uploaded_file:
             file_ext = Path(uploaded_file.name).suffix.lower()
             if file_ext not in ['.xlsx', '.xls', '.csv']:
                 st.error(f"Неподдерживаемый тип файла: {file_ext}")
                 return
         
-        # Схемы ожидаемых системных полей для каждого типа файла
         schemas = {
             'oe': ['oe_number', 'artikul', 'brand', 'name', 'applicability',
                    'length', 'width', 'height', 'weight', 'dimensions_str', 'price', 'currency'],
@@ -1893,7 +1837,6 @@ class HighVolumeAutoPartsCatalog:
         }
         
         if uploaded_file:
-            # При смене файла сбрасываем старые настройки маппинга
             file_id = f"{file_type}_{uploaded_file.name}"
             if st.session_state.get("current_upload_file") != file_id:
                 keys_to_clear = [k for k in st.session_state.keys() if k.startswith("map_")]
@@ -1901,14 +1844,12 @@ class HighVolumeAutoPartsCatalog:
                     del st.session_state[k]
                 st.session_state["current_upload_file"] = file_id
             
-            # Сохраняем файл во временное расположение
             temp_path = self.data_dir / f"temp_{file_type}_{uploaded_file.name}"
             with open(temp_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
             
             st.info(f"Файл сохранён: `{temp_path.name}` ({uploaded_file.size / 1024:.1f} КБ)")
             
-            # Читаем файл для предпросмотра (кэшируем в session_state)
             cache_key = f"preview_df_{file_type}_{uploaded_file.name}"
             if cache_key not in st.session_state:
                 try:
@@ -1926,18 +1867,11 @@ class HighVolumeAutoPartsCatalog:
                 temp_path.unlink(missing_ok=True)
                 return
             
-            # ------------------------------------------------------------------
-            # Предпросмотр данных
-            # ------------------------------------------------------------------
             st.subheader("👀 Предпросмотр данных (первые 5 строк)")
             st.dataframe(raw_df.head(5).to_pandas(), use_container_width=True)
             
-            # ------------------------------------------------------------------
-            # Интерактивный маппинг столбцов
-            # ------------------------------------------------------------------
             expected_cols = schemas.get(file_type, [])
             auto_mapping = self.detect_columns(raw_df.columns, expected_cols)
-            # auto_mapping: {file_col: system_field} → инвертируем в {system_field: file_col}
             auto_inverted = {v: k for k, v in auto_mapping.items()}
             
             st.subheader("🔗 Маппинг столбцов (Power Query стиль)")
@@ -1945,9 +1879,8 @@ class HighVolumeAutoPartsCatalog:
                        "Система предзаполнила значения на основе автоматического распознавания.")
             
             file_columns = list(raw_df.columns)
-            mapping_choices = {}  # system_field -> file_col
+            mapping_choices = {}
             
-            # Разбиваем поля на строки по 3 для компактности
             cols_per_row = 3
             field_chunks = [expected_cols[i:i+cols_per_row] for i in range(0, len(expected_cols), cols_per_row)]
             
@@ -1967,13 +1900,11 @@ class HighVolumeAutoPartsCatalog:
                         if chosen != "(не выбрано)":
                             mapping_choices[field] = chosen
             
-            # Проверка: одна колонка не может использоваться для двух полей
             used_cols = list(mapping_choices.values())
             if len(used_cols) != len(set(used_cols)):
                 st.warning("⚠️ Одна и та же колонка файла назначена нескольким системным полям. "
                            "Проверьте маппинг.")
             
-            # Статистика распознавания
             n_mapped = len(mapping_choices)
             n_unmapped = len(expected_cols) - n_mapped
             
@@ -1987,12 +1918,8 @@ class HighVolumeAutoPartsCatalog:
                 st.warning("Не назначено ни одной колонки. Загрузка невозможна.")
                 return
             
-            # ------------------------------------------------------------------
-            # Подтверждение и загрузка в базу
-            # ------------------------------------------------------------------
             if st.button("💾 Подтвердить и загрузить в базу", key="upload_confirm_button"):
                 with st.spinner("Нормализация и запись в базу..."):
-                    # Инвертируем маппинг: {file_col: system_field}
                     final_mapping = {v: k for k, v in mapping_choices.items()}
                     
                     df = self.read_and_prepare_file(str(temp_path), file_type, column_mapping=final_mapping)
@@ -2002,7 +1929,6 @@ class HighVolumeAutoPartsCatalog:
                         temp_path.unlink(missing_ok=True)
                         return
                     
-                    # Отчёт об ошибках валидации
                     if "_validation_errors" in df.columns:
                         error_rows = df.filter(pl.col("_validation_errors") != "")
                         n_errors = len(error_rows)
@@ -2019,7 +1945,6 @@ class HighVolumeAutoPartsCatalog:
                     self.process_and_load_data(dataframes)
                     st.success(f"✅ {len(df)} записей успешно загружено в базу")
                     
-                    # Очистка временных данных
                     temp_path.unlink(missing_ok=True)
                     if cache_key in st.session_state:
                         del st.session_state[cache_key]
@@ -2027,9 +1952,6 @@ class HighVolumeAutoPartsCatalog:
         
         st.divider()
         
-        # ------------------------------------------------------------------
-        # Массовая загрузка (автоматический маппинг по эвристике + объединение нескольких таблиц)
-        # ------------------------------------------------------------------
         st.subheader("⚡ Массовая загрузка нескольких файлов")
         st.caption("Загрузите несколько файлов одновременно. Тип определяется автоматически по имени файла. Файлы одного типа будут объединены.")
         
@@ -2041,7 +1963,6 @@ class HighVolumeAutoPartsCatalog:
         )
         
         if uploaded_files:
-            # Группировка файлов по определенному типу
             files_by_type = {
                 'oe': [], 'cross': [], 'prices': [], 
                 'dimensions': [], 'barcode': [], 'images': [], 'universal': []
@@ -2065,7 +1986,6 @@ class HighVolumeAutoPartsCatalog:
                 
                 files_by_type[detected_type].append(file)
 
-            # Убираем пустые категории
             files_by_type = {k: v for k, v in files_by_type.items() if v}
             
             st.write(f"📂 Распределено файлов по категориям: **{ {k: len(v) for k, v in files_by_type.items()} }**")
@@ -2084,17 +2004,13 @@ class HighVolumeAutoPartsCatalog:
                                     f_out.write(file.getbuffer())
                                 temp_paths_to_clean.append(temp_path)
                                 
-                                # Читаем и подготавливаем каждый файл
                                 df = self.read_and_prepare_file(str(temp_path), ftype)
                                 if not df.is_empty():
                                     type_dfs.append(df)
                             
-                            # Объединяем все датафреймы одного типа
                             if type_dfs:
-                                # diagonal_relaxed позволяет объединять датафреймы с разным набором колонок
                                 combined_df = pl.concat(type_dfs, how="diagonal_relaxed")
                                 
-                                # Удаляем полные дубликаты по ключевым колонкам после объединения
                                 key_cols = [c for c in ['oe_number_norm', 'artikul_norm', 'brand_norm'] if c in combined_df.columns]
                                 if key_cols:
                                     combined_df = combined_df.unique(subset=key_cols, keep='first')
@@ -2119,12 +2035,10 @@ class HighVolumeAutoPartsCatalog:
     def show_search_interface(self):
         """
         Расширенный поиск по каталогу: OE-номер + Бренд + Часть артикула + Диапазон цен.
-        Все критерии можно комбинировать (требование №1).
         """
         st.header("🔍 Поиск по каталогу")
         st.info("Ищите по OE-номеру и комбинируйте критерии: бренд, часть артикула, диапазон цен.")
         
-        # Получаем список брендов для фильтра
         try:
             with self.db_lock:
                 brands_result = self.conn.execute(
@@ -2134,7 +2048,6 @@ class HighVolumeAutoPartsCatalog:
             logger.error(f"Ошибка получения брендов: {e}")
             available_brands = []
         
-        # Форма поиска
         col1, col2 = st.columns(2)
         with col1:
             oe_input = st.text_input("🔑 OE-номер (точный поиск):", key="search_oe_input",
@@ -2166,7 +2079,6 @@ class HighVolumeAutoPartsCatalog:
                     
                     st.dataframe(result_df, use_container_width=True)
                     
-                    # Экспорт результата поиска
                     csv = result_df.to_csv(sep=';', index=False).encode('utf-8-sig')
                     st.download_button("📥 Скачать результат (CSV)", data=csv,
                                        file_name="search_result.csv", mime="text/csv",
@@ -2179,30 +2091,25 @@ class HighVolumeAutoPartsCatalog:
     def execute_search(self, oe_input: str, brand_filter: str, artikul_input: str,
                        price_min: float, price_max: float) -> Tuple[Optional[pd.DataFrame], str]:
         """
-        Выполняет комбинированный поиск с параметризованным SQL-запросом
-        (защита от SQL-инъекций). Возвращает (DataFrame, текст_запроса).
+        Выполняет комбинированный поиск с параметризованным SQL-запросом.
         """
         where_clauses = []
         params = []
         
-        # OE-номер: точный поиск по нормализованному ключу
         if oe_input and oe_input.strip():
             oe_norm = self.normalize_key(pl.Series([oe_input.strip()]))[0]
             where_clauses.append("cr.oe_number_norm = ?")
             params.append(oe_norm)
         
-        # Бренд: точное совпадение
         if brand_filter and brand_filter != "(все бренды)":
             where_clauses.append("p.brand = ?")
             params.append(brand_filter)
         
-        # Часть артикула: нечёткий поиск по нормализованному ключу
         if artikul_input and artikul_input.strip():
             artikul_norm = self.normalize_key(pl.Series([artikul_input.strip()]))[0]
             where_clauses.append("p.artikul_norm LIKE ?")
             params.append(f"%{artikul_norm}%")
         
-        # Диапазон цен
         if price_min and price_min > 0:
             where_clauses.append("pr.price >= ?")
             params.append(price_min)
@@ -2404,7 +2311,6 @@ class HighVolumeAutoPartsCatalog:
         from_clause = f"FROM {main_table}"
         join_clauses = []
         
-        # Известные связи между таблицами
         joins = [
             ("parts", "cross_references", "parts.artikul_norm = cross_references.artikul_norm AND parts.brand_norm = cross_references.brand_norm"),
             ("oe", "cross_references", "oe.oe_number_norm = cross_references.oe_number_norm"),
@@ -2415,7 +2321,6 @@ class HighVolumeAutoPartsCatalog:
         used = {main_table}
         connected_tables = {main_table}
         
-        # Итеративно добавляем JOIN'ы, пока все нужные таблицы не будут связаны
         changed = True
         while changed:
             changed = False
