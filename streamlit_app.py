@@ -18,7 +18,7 @@ import polars as pl
 import pandas as pd
 
 # ============================================================================
-# НАСТРОЙКА ЛОГИРОВАНИЯ (Исправлено: добавлен вывод в консоль)
+# НАСТРОЙКА ЛОГИРОВАНИЯ (Исправлено: добавлен вывод в консоль Streamlit)
 # ============================================================================
 log_dir = Path("./auto_parts_data")
 log_dir.mkdir(exist_ok=True)
@@ -27,7 +27,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(log_dir / "app.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout) # ДОБАВЛЕНО: Вывод в консоль Streamlit
+        logging.StreamHandler(sys.stdout) # ДОБАВЛЕНО: Вывод в консоль сервера
     ]
 )
 logger = logging.getLogger(__name__)
@@ -370,7 +370,7 @@ class HighVolumeAutoPartsCatalog:
             return 0.0
     
     # ========================================================================
-    # ✅ ОБРАБОТКА ФАЙЛОВ (ИСПРАВЛЕНО v100.20)
+    # ✅ ОБРАБОТКА ФАЙЛОВ (ПОЛНОСТЬЮ ПЕРЕПИСАНА И ИСПРАВЛЕНА)
     # ========================================================================
     def detect_columns(self, actual_columns: List[str], expected_columns: List[str]) -> Dict[str, str]:
         column_variants = {
@@ -501,21 +501,20 @@ class HighVolumeAutoPartsCatalog:
                 df = df.with_columns(self.clean_values(pl.col(col)).alias(col))
         
         # ====================================================================
-        # ✅ ИСПРАВЛЕННЫЙ БЛОК КОНВЕРТАЦИИ ЧИСЕЛ (через Polars, без ручных циклов)
+        # ✅ ПОЛНОСТЬЮ ИСПРАВЛЕННЫЙ БЛОК КОНВЕРТАЦИИ ЧИСЕЛ (через Polars)
         # ====================================================================
         numeric_cols = ['length', 'width', 'height', 'weight', 'price']
         for col in numeric_cols:
             if col in df.columns:
                 try:
-                    # Используем встроенные методы Polars для чистки и конвертации
-                    # Это намного надежнее и быстрее, чем перебор Python-списков
+                    # Polars работает с колонками, а не с циклом Python. Это исключает ошибки типов.
                     df = df.with_columns(
                         pl.col(col)
                         .cast(pl.Utf8)                                      # В строку
                         .str.replace_all(r'[^\d.,\-]', '')                   # Удаляем все символы кроме цифр, точек, запятых и минуса
                         .str.replace(',', '.')                              # Заменяем запятую на точку
                         .str.replace(r'\.(?=.*\.)', '')                     # Оставляем только последнюю точку (убираем лишние)
-                        .cast(pl.Float64, strict=False)                     # Конвертируем в число. Если не получается - будет null
+                        .cast(pl.Float64, strict=False)                     # Конвертируем в число. Невалидное становится null
                         .fill_null(0.0)                                     # Null превращаем в 0.0
                         .round(2)
                         .alias(col)
@@ -562,15 +561,18 @@ class HighVolumeAutoPartsCatalog:
                     f.write(uploaded_file.getbuffer())
                 
                 # ====================================================================
-                # ✅ ИСПРАВЛЕНИЕ: Обработка с выводом точной ошибки в интерфейс
+                # ✅ ОБРАБОТКА С ВЫВОДОМ ТОЧНОЙ ОШИБКИ В ИНТЕРФЕЙС
                 # ====================================================================
                 try:
                     df = self.read_and_prepare_file(str(temp_path), file_type)
                     if not df.is_empty():
                         dfs_for_type.append(df)
+                        logger.info(f"✅ Файл '{uploaded_file.name}' успешно обработан. Строк: {len(df)}")
+                    else:
+                        logger.warning(f"⚠️ Файл '{uploaded_file.name}' обработан, но DataFrame пуст.")
                 except Exception as e:
-                    # Выводим ошибку прямо на экран, чтобы пользователь видел
-                    st.error(f"❌ Ошибка при обработке файла '{uploaded_file.name}': {str(e)}")
+                    # Выводим ошибку прямо на экран, чтобы пользователь знал, что делать
+                    st.error(f"❌ Критическая ошибка при обработке файла '{uploaded_file.name}': {str(e)}")
                     logger.exception(f"Ошибка обработки файла {uploaded_file.name}")
                 # ====================================================================
                 
