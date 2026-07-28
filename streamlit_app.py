@@ -9,6 +9,8 @@ import io
 import hashlib
 import tempfile
 import functools
+import shutil
+import platform
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Set
@@ -31,7 +33,7 @@ import logging.handlers
 log_file = log_dir / "app.log"
 file_handler = logging.handlers.RotatingFileHandler(
     log_file,
-    maxBytes=10 * 1024 * 1024,  # 10 МБ
+    maxBytes=10 * 1024 * 1024,
     backupCount=5,
     encoding="utf-8"
 )
@@ -74,19 +76,15 @@ def get_memory_usage() -> float:
     """Получение использования памяти без psutil"""
     try:
         import resource
-        # В Linux/Mac можно использовать resource
         usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         if sys.platform == 'darwin':
-            # На Mac возвращается в байтах
             return usage / (1024 * 1024)
         else:
-            # На Linux в килобайтах
             return usage / 1024
     except (ImportError, AttributeError):
         pass
     
     try:
-        # Альтернативный способ через /proc (Linux)
         if sys.platform == 'linux':
             with open('/proc/self/status', 'r') as f:
                 for line in f:
@@ -99,7 +97,7 @@ def get_memory_usage() -> float:
 
 
 def memory_monitor():
-    """Мониторинг использования памяти (безопасная версия)"""
+    """Мониторинг использования памяти"""
     mem_mb = get_memory_usage()
     logger.info(f"💾 Использование памяти: {mem_mb:.1f} МБ")
     return mem_mb
@@ -123,7 +121,7 @@ def temp_upload_file(uploaded_file):
 
 
 # ============================================================================
-# БЛОК 1: HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ПОЛНАЯ ВЕРСИЯ v200.1)
+# БЛОК 1: HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ПОЛНАЯ ВЕРСИЯ v200.2)
 # ============================================================================
 class HighVolumeAutoPartsCatalog:
     """
@@ -169,7 +167,6 @@ class HighVolumeAutoPartsCatalog:
         """Инициализация DuckDB с оптимизациями производительности"""
         conn = duckdb.connect(database=str(self.db_path))
         
-        # Настройка параметров производительности
         try:
             conn.execute("SET memory_limit = '4GB'")
             conn.execute("SET threads = 4")
@@ -204,7 +201,6 @@ class HighVolumeAutoPartsCatalog:
             try:
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
-                # Объединение с дефолтными значениями для новых полей
                 return {**default_config, **config}
             except Exception as e:
                 logger.error(f"Ошибка чтения cloud_config.json: {e}")
@@ -1156,7 +1152,21 @@ class HighVolumeAutoPartsCatalog:
             
             if dfs_for_type:
                 try:
-                    combined_df = pl.concat(dfs_for_type)
+                    # ИСПРАВЛЕНИЕ: Выравнивание колонок перед объединением
+                    all_columns = set()
+                    for d in dfs_for_type:
+                        all_columns.update(d.columns)
+                    
+                    aligned_dfs = []
+                    for d in dfs_for_type:
+                        missing_cols = all_columns - set(d.columns)
+                        d_aligned = d
+                        for mc in missing_cols:
+                            d_aligned = d_aligned.with_columns(pl.lit(None).alias(mc))
+                        d_aligned = d_aligned.select(sorted(all_columns))
+                        aligned_dfs.append(d_aligned)
+                    
+                    combined_df = pl.concat(aligned_dfs)
                     results[file_type] = combined_df.unique(keep='first')
                     logger.info(f"📦 Тип {file_type}: объединено {len(combined_df)} записей")
                 except Exception as e:
@@ -1387,7 +1397,21 @@ class HighVolumeAutoPartsCatalog:
         if not parts_to_concat:
             return
         
-        parts_df = pl.concat(parts_to_concat).filter(
+        # Выравнивание колонок перед объединением
+        all_cols = set()
+        for d in parts_to_concat:
+            all_cols.update(d.columns)
+        
+        aligned_parts = []
+        for d in parts_to_concat:
+            missing = all_cols - set(d.columns)
+            d_aligned = d
+            for mc in missing:
+                d_aligned = d_aligned.with_columns(pl.lit(None).alias(mc))
+            d_aligned = d_aligned.select(sorted(all_cols))
+            aligned_parts.append(d_aligned)
+        
+        parts_df = pl.concat(aligned_parts).filter(
             pl.col('artikul_norm') != ""
         ).unique(subset=['artikul_norm', 'brand_norm'], keep='first')
         
@@ -1515,11 +1539,23 @@ class HighVolumeAutoPartsCatalog:
         return df.drop(['_art', '_brd', '_mult'])
     
     # ========================================================================
-    # ЭКСПОРТ (УЛУЧШЕННЫЙ)
+    # ЭКСПОРТ (ИСПРАВЛЕННЫЙ - УПРОЩЕННЫЙ CTE)
     # ========================================================================
+    def _get_brand_markups_sql(self) -> str:
+        """Получение SQL для наценок по брендам"""
+        rows = []
+        for brand, markup in self.price_rules['brand_markups'].items():
+            safe_brand = brand.replace("'", "''")
+            rows.append(f"SELECT '{safe_brand}' AS brand, {markup} AS markup")
+        
+        if rows:
+            return " UNION ALL ".join(rows)
+        else:
+            return "SELECT NULL AS brand, NULL AS markup LIMIT 0"
+    
     def build_export_query(self, selected_columns=None, include_prices=True, 
                           apply_markup=True, apply_exclusions=True, use_link_rules=True):
-        """Построение запроса для экспорта с учетом всех настроек"""
+        """Построение запроса для экспорта с учетом всех настроек (ИСПРАВЛЕННАЯ ВЕРСИЯ)"""
         description_text = (
             "Состояние товара: новый (в упаковке). Высококачественные автозапчасти и автотовары — "
             "надежное решение для вашего автомобиля. Обеспечьте безопасность, долговечность и "
@@ -1535,6 +1571,8 @@ class HighVolumeAutoPartsCatalog:
             max_depth = 1
             link_by_oe_only = False
         
+        brand_markups_sql = self._get_brand_markups_sql()
+        
         # Формирование списка колонок
         select_parts = []
         
@@ -1546,34 +1584,28 @@ class HighVolumeAutoPartsCatalog:
             if apply_markup:
                 global_markup = self.price_rules.get('global_markup', 0)
                 select_parts.append(
-                    f"CASE WHEN pr.price IS NOT NULL THEN ROUND(pr.price * (1 + {global_markup}), 2) ELSE pr.price END AS \"Цена\""
+                    f"CASE WHEN pr.price IS NOT NULL THEN pr.price * (1 + COALESCE(brm.markup, {global_markup})) ELSE pr.price END AS \"Цена\""
                 )
             else:
-                select_parts.append('ROUND(pr.price, 2) AS "Цена"')
+                select_parts.append('pr.price AS "Цена"')
             select_parts.append("COALESCE(pr.currency, 'RUB') AS \"Валюта\"")
         
         # Основные колонки
         columns_map = {
             "Артикул бренда": 'r.artikul AS "Артикул бренда"',
             "Бренд": 'r.brand AS "Бренд"',
-            "Наименование": 'COALESCE(pd.representative_name, \'\') AS "Наименование"',
-            "Применимость": 'COALESCE(pd.representative_applicability, \'\') AS "Применимость"',
+            "Наименование": 'COALESCE(r.representative_name, r.analog_representative_name) AS "Наименование"',
+            "Применимость": 'COALESCE(r.representative_applicability, r.analog_representative_applicability) AS "Применимость"',
             "Описание": 'r.description AS "Описание"',
-            "Категория товара": 'COALESCE(pd.representative_category, \'Разное\') AS "Категория товара"',
+            "Категория товара": 'COALESCE(r.representative_category, r.analog_representative_category) AS "Категория товара"',
             "Кратность": 'r.multiplicity AS "Кратность"',
-            "Длинна": 'ROUND(CAST(r.length AS DOUBLE), 2) AS "Длинна"',
-            "Ширина": 'ROUND(CAST(r.width AS DOUBLE), 2) AS "Ширина"',
-            "Высота": 'ROUND(CAST(r.height AS DOUBLE), 2) AS "Высота"',
-            "Вес": 'ROUND(CAST(r.weight AS DOUBLE), 2) AS "Вес"',
-            "Длинна/Ширина/Высота": """
-                CASE
-                    WHEN r.dimensions_str IS NULL OR r.dimensions_str = '' OR UPPER(TRIM(r.dimensions_str)) = 'XX'
-                    THEN NULL
-                    ELSE r.dimensions_str
-                END AS "Длинна/Ширина/Высота"
-            """,
-            "OE номер": 'pd.oe_list AS "OE номер"',
-            "аналоги": 'aa.analog_list AS "аналоги"',
+            "Длинна": 'COALESCE(NULLIF(ROUND(CAST(r.length AS DOUBLE), 2), 0), NULLIF(ROUND(CAST(r.analog_length AS DOUBLE), 2), 0), 0.0) AS "Длинна"',
+            "Ширина": 'COALESCE(NULLIF(ROUND(CAST(r.width AS DOUBLE), 2), 0), NULLIF(ROUND(CAST(r.analog_width AS DOUBLE), 2), 0), 0.0) AS "Ширина"',
+            "Высота": 'COALESCE(NULLIF(ROUND(CAST(r.height AS DOUBLE), 2), 0), NULLIF(ROUND(CAST(r.analog_height AS DOUBLE), 2), 0), 0.0) AS "Высота"',
+            "Вес": 'COALESCE(NULLIF(ROUND(CAST(r.weight AS DOUBLE), 2), 0), NULLIF(ROUND(CAST(r.analog_weight AS DOUBLE), 2), 0), 0.0) AS "Вес"',
+            "Длинна/Ширина/Высота": 'COALESCE(NULLIF(r.dimensions_str, \'\'), r.analog_dimensions_str) AS "Длинна/Ширина/Высота"',
+            "OE номер": 'r.oe_list AS "OE номер"',
+            "аналоги": 'r.analog_list AS "аналоги"',
             "Ссылка на изображение": 'r.image_url AS "Ссылка на изображение"'
         }
         
@@ -1593,15 +1625,21 @@ class HighVolumeAutoPartsCatalog:
             for rule in self.exclusion_rules:
                 safe_rule = rule.replace("'", "''")
                 exclusion_conditions.append(
-                    f"LOWER(COALESCE(pd.representative_name, '')) NOT LIKE '%{safe_rule.lower()}%'"
+                    f"LOWER(COALESCE(r.representative_name, '')) NOT LIKE '%{safe_rule.lower()}%'"
                 )
             
             if exclusion_conditions:
                 exclusion_where = "AND " + " AND ".join(exclusion_conditions)
         
-        # Сборка полного запроса
+        # ИСПРАВЛЕННЫЙ CTE - oe_number_norm явно указан в Level1Analogs
         query = f"""
-        WITH PartDetails AS (
+        WITH DescriptionTemplate AS (
+            SELECT CHR(10) || CHR(10) || $${description_text}$$ AS text
+        ),
+        BrandMarkups AS (
+            SELECT brand, markup FROM ({brand_markups_sql}) AS tmp
+        ),
+        PartDetails AS (
             SELECT
                 cr.artikul_norm,
                 cr.brand_norm,
@@ -1623,14 +1661,96 @@ class HighVolumeAutoPartsCatalog:
             JOIN parts p2 ON cr2.artikul_norm = p2.artikul_norm AND cr2.brand_norm = p2.brand_norm
             WHERE (cr1.artikul_norm != p2.artikul_norm OR cr1.brand_norm != p2.brand_norm)
             GROUP BY cr1.artikul_norm, cr1.brand_norm
+        ),
+        InitialOENumbers AS (
+            SELECT DISTINCT p.artikul_norm, p.brand_norm, cr.oe_number_norm
+            FROM parts p
+            LEFT JOIN cross_references cr ON p.artikul_norm = cr.artikul_norm AND p.brand_norm = cr.brand_norm
+            WHERE cr.oe_number_norm IS NOT NULL
+        ),
+        Level1Analogs AS (
+            SELECT DISTINCT
+                i.artikul_norm AS source_artikul_norm,
+                i.brand_norm AS source_brand_norm,
+                i.oe_number_norm AS oe_number_norm,
+                cr2.artikul_norm AS related_artikul_norm,
+                cr2.brand_norm AS related_brand_norm
+            FROM InitialOENumbers i
+            JOIN cross_references cr2 ON i.oe_number_norm = cr2.oe_number_norm
+            WHERE NOT (i.artikul_norm = cr2.artikul_norm AND i.brand_norm = cr2.brand_norm)
+        ),
+        Level1OENumbers AS (
+            SELECT DISTINCT
+                l1.source_artikul_norm,
+                l1.source_brand_norm,
+                cr3.oe_number_norm
+            FROM Level1Analogs l1
+            JOIN cross_references cr3 ON l1.oe_number_norm = cr3.oe_number_norm
+            WHERE NOT EXISTS (
+                SELECT 1 FROM InitialOENumbers i
+                WHERE i.artikul_norm = l1.source_artikul_norm
+                AND i.brand_norm = l1.source_brand_norm
+                AND i.oe_number_norm = cr3.oe_number_norm
+            )
+        ),
+        Level2Analogs AS (
+            SELECT DISTINCT
+                loe.source_artikul_norm,
+                loe.source_brand_norm,
+                cr4.artikul_norm AS related_artikul_norm,
+                cr4.brand_norm AS related_brand_norm
+            FROM Level1OENumbers loe
+            JOIN cross_references cr4 ON loe.oe_number_norm = cr4.oe_number_norm
+            WHERE NOT (loe.source_artikul_norm = cr4.artikul_norm AND loe.source_brand_norm = cr4.brand_norm)
+        ),
+        AllRelatedParts AS (
+            SELECT source_artikul_norm, source_brand_norm, related_artikul_norm, related_brand_norm FROM Level1Analogs
+            UNION
+            SELECT source_artikul_norm, source_brand_norm, related_artikul_norm, related_brand_norm FROM Level2Analogs
+        ),
+        AggregatedAnalogData AS (
+            SELECT
+                arp.source_artikul_norm AS artikul_norm,
+                arp.source_brand_norm AS brand_norm,
+                ROUND(MAX(CASE WHEN p2.length IS NOT NULL AND p2.length != 0 THEN p2.length ELSE NULL END), 2) AS analog_length,
+                ROUND(MAX(CASE WHEN p2.width IS NOT NULL AND p2.width != 0 THEN p2.width ELSE NULL END), 2) AS analog_width,
+                ROUND(MAX(CASE WHEN p2.height IS NOT NULL AND p2.height != 0 THEN p2.height ELSE NULL END), 2) AS analog_height,
+                ROUND(MAX(CASE WHEN p2.weight IS NOT NULL AND p2.weight != 0 THEN p2.weight ELSE NULL END), 2) AS analog_weight,
+                ANY_VALUE(CASE WHEN p2.dimensions_str IS NOT NULL AND p2.dimensions_str != '' AND UPPER(TRIM(p2.dimensions_str)) != 'XX' THEN p2.dimensions_str ELSE NULL END) AS analog_dimensions_str,
+                ANY_VALUE(CASE WHEN pd2.representative_name IS NOT NULL AND pd2.representative_name != '' THEN pd2.representative_name ELSE NULL END) AS analog_representative_name,
+                ANY_VALUE(CASE WHEN pd2.representative_applicability IS NOT NULL AND pd2.representative_applicability != '' THEN pd2.representative_applicability ELSE NULL END) AS analog_representative_applicability,
+                ANY_VALUE(CASE WHEN pd2.representative_category IS NOT NULL AND pd2.representative_category != '' THEN pd2.representative_category ELSE NULL END) AS analog_representative_category
+            FROM AllRelatedParts arp
+            JOIN parts p2 ON arp.related_artikul_norm = p2.artikul_norm AND arp.related_brand_norm = p2.brand_norm
+            LEFT JOIN PartDetails pd2 ON p2.artikul_norm = pd2.artikul_norm AND p2.brand_norm = pd2.brand_norm
+            GROUP BY arp.source_artikul_norm, arp.source_brand_norm
+        ),
+        RankedData AS (
+            SELECT
+                p.artikul_norm, p.brand_norm, p.artikul, p.brand, p.description, p.multiplicity,
+                ROUND(CAST(p.length AS DOUBLE), 2) AS length,
+                ROUND(CAST(p.width AS DOUBLE), 2) AS width,
+                ROUND(CAST(p.height AS DOUBLE), 2) AS height,
+                ROUND(CAST(p.weight AS DOUBLE), 2) AS weight,
+                p.dimensions_str, p.image_url,
+                pd.representative_name, pd.representative_applicability, pd.representative_category, pd.oe_list,
+                aa.analog_list,
+                p_analog.analog_length, p_analog.analog_width, p_analog.analog_height, p_analog.analog_weight,
+                p_analog.analog_dimensions_str,
+                p_analog.analog_representative_name, p_analog.analog_representative_applicability, p_analog.analog_representative_category,
+                ROW_NUMBER() OVER (PARTITION BY p.artikul_norm, p.brand_norm ORDER BY pd.representative_name DESC NULLS LAST, pd.oe_list DESC NULLS LAST) AS rn
+            FROM parts p
+            LEFT JOIN PartDetails pd ON p.artikul_norm = pd.artikul_norm AND p.brand_norm = pd.brand_norm
+            LEFT JOIN AllAnalogs aa ON p.artikul_norm = aa.artikul_norm AND p.brand_norm = aa.brand_norm
+            LEFT JOIN AggregatedAnalogData p_analog ON p.artikul_norm = p_analog.artikul_norm AND p.brand_norm = p_analog.brand_norm
         )
         SELECT
             {select_clause}
-        FROM parts r
-        LEFT JOIN PartDetails pd ON r.artikul_norm = pd.artikul_norm AND r.brand_norm = pd.brand_norm
-        LEFT JOIN AllAnalogs aa ON r.artikul_norm = aa.artikul_norm AND r.brand_norm = aa.brand_norm
+        FROM RankedData r
+        CROSS JOIN DescriptionTemplate dt
         {'LEFT JOIN prices pr ON r.artikul_norm = pr.artikul_norm AND r.brand_norm = pr.brand_norm' if include_prices else ''}
-        WHERE 1=1
+        {'LEFT JOIN BrandMarkups brm ON r.brand = brm.brand' if include_prices and apply_markup else ''}
+        WHERE r.rn = 1
         {exclusion_where}
         ORDER BY r.brand, r.artikul
         """
@@ -1655,6 +1775,8 @@ class HighVolumeAutoPartsCatalog:
             query = self.build_export_query(
                 selected_columns, include_prices, apply_markup, apply_exclusions
             )
+            
+            logger.info(f"Executing export query (первые 500 символов): {query[:500]}...")
             
             # Чанковый экспорт для больших объемов
             if total > 500_000:
@@ -2915,7 +3037,6 @@ class HighVolumeAutoPartsCatalog:
                     if confirm1 and confirm2:
                         try:
                             # Создание бэкапа перед удалением
-                            import shutil
                             backup_path = self.data_dir / f"backup_before_clean_{datetime.now().strftime('%Y%m%d_%H%M%S')}.duckdb"
                             shutil.copy2(self.db_path, backup_path)
                             
@@ -2940,9 +3061,6 @@ class HighVolumeAutoPartsCatalog:
             with st.spinner("Выполнение диагностики..."):
                 # Health check
                 health = self.check_database_health()
-                
-                # Системная информация
-                import platform
                 
                 col1, col2 = st.columns(2)
                 
@@ -3018,13 +3136,13 @@ def get_high_volume_catalog():
 
 def main():
     st.set_page_config(
-        page_title="Каталог автозапчастей v200.1",
+        page_title="Каталог автозапчастей v200.2",
         page_icon="🔧",
         layout="wide",
         initial_sidebar_state="expanded"
     )
     
-    st.title("🔧 Каталог автозапчастей v200.1")
+    st.title("🔧 Каталог автозапчастей v200.2")
     
     # Инициализация каталога
     catalog = get_high_volume_catalog()
