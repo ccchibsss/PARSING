@@ -1169,6 +1169,8 @@ class HighVolumeAutoPartsCatalog:
                                     column_types[col] = pl.Float64
                                 elif col in ['multiplicity']:
                                     column_types[col] = pl.Int64
+                                elif col in ['oe_number', 'oe_number_norm', 'artikul', 'brand', 'artikul_norm', 'brand_norm', 'name', 'applicability', 'dimensions_str', 'image_url', 'barcode', 'description', 'category', 'Марка', 'Марка авто', 'Страна']:
+                                    column_types[col] = pl.Utf8
                                 else:
                                     column_types[col] = pl.Utf8
                     
