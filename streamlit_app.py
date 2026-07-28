@@ -872,6 +872,54 @@ class HighVolumeAutoPartsCatalog:
             return 0.0
     
     # ========================================================================
+    # ОПРЕДЕЛЕНИЕ ТИПА ФАЙЛА (ДЛЯ UNIVERSAL)
+    # ========================================================================
+    def _detect_file_type(self, columns: Set[str]) -> str:
+        """
+        Определение типа файла по набору колонок (для универсальных файлов)
+        """
+        # Преобразуем все в нижний регистр для поиска
+        cols_lower = {c.lower() for c in columns}
+        
+        # Проверяем наличие ключевых колонок для каждого типа
+        # Приоритет: cross -> oe -> dimensions -> barcode -> images -> prices
+        
+        # 1. Кросс-ссылки: должны быть и OE, и артикул
+        if 'oe' in cols_lower and ('artikul' in cols_lower or 'артикул' in cols_lower):
+            return 'cross'
+        
+        # 2. OE данные: есть OE, артикул и название/применимость
+        if 'oe' in cols_lower and ('name' in cols_lower or 'наименование' in cols_lower or 'applicability' in cols_lower or 'применимость' in cols_lower):
+            return 'oe'
+        
+        # 3. Габариты: есть размеры
+        dimension_cols = {'длина', 'длина (см)', 'length', 'ширина', 'ширина (см)', 'width', 
+                         'высота', 'высота (см)', 'height', 'вес', 'вес (кг)', 'weight'}
+        if len(cols_lower & dimension_cols) >= 2 and ('artikul' in cols_lower or 'артикул' in cols_lower):
+            return 'dimensions'
+        
+        # 4. Штрих-коды: есть barcode или EAN13
+        barcode_cols = {'barcode', 'штрих-код', 'штрихкод', 'ean13', 'ean'}
+        if len(cols_lower & barcode_cols) >= 1:
+            return 'barcode'
+        
+        # 5. Изображения: есть URL изображения
+        image_cols = {'image_url', 'ссылка на изображение', 'изображение', 'image', 'img'}
+        if len(cols_lower & image_cols) >= 1:
+            return 'images'
+        
+        # 6. Цены: есть цена
+        price_cols = {'price', 'цена', 'cost'}
+        if len(cols_lower & price_cols) >= 1:
+            return 'prices'
+        
+        # 7. Если есть артикул и бренд - пытаемся как OE
+        if ('artikul' in cols_lower or 'артикул' in cols_lower) and ('brand' in cols_lower or 'бренд' in cols_lower):
+            return 'oe'
+        
+        return 'unknown'
+    
+    # ========================================================================
     # РАСШИРЕННАЯ ОБРАБОТКА ФАЙЛОВ
     # ========================================================================
     def detect_columns_advanced(self, actual_columns: List[str], file_type: str) -> Dict[str, str]:
@@ -1122,13 +1170,94 @@ class HighVolumeAutoPartsCatalog:
         
         return df
     
+    def _align_dataframes_for_concat(self, dfs: List[pl.DataFrame]) -> List[pl.DataFrame]:
+        """
+        Выравнивание списка DataFrames для объединения с приведением типов
+        """
+        if not dfs:
+            return []
+        
+        if len(dfs) == 1:
+            return dfs
+        
+        # Собираем все колонки
+        all_columns = set()
+        for d in dfs:
+            all_columns.update(d.columns)
+        
+        # Определяем типы для каждой колонки
+        column_types = {}
+        for d in dfs:
+            for col in all_columns:
+                if col in d.columns and col not in column_types:
+                    column_types[col] = d[col].dtype
+                elif col not in d.columns and col not in column_types:
+                    # Определяем тип по умолчанию в зависимости от имени колонки
+                    if col in ['length', 'width', 'height', 'weight', 'price']:
+                        column_types[col] = pl.Float64
+                    elif col in ['multiplicity']:
+                        column_types[col] = pl.Int64
+                    elif col in ['oe_number', 'oe_number_norm', 'artikul', 'brand', 'artikul_norm', 'brand_norm', 'name', 'applicability', 'dimensions_str', 'image_url', 'barcode', 'description', 'category', 'Марка', 'Марка авто', 'Страна']:
+                        column_types[col] = pl.Utf8
+                    else:
+                        column_types[col] = pl.Utf8
+        
+        aligned_dfs = []
+        for d in dfs:
+            d_aligned = d
+            
+            # Добавляем отсутствующие колонки с правильными типами
+            for mc in all_columns:
+                if mc not in d.columns:
+                    target_type = column_types.get(mc, pl.Utf8)
+                    if target_type == pl.Float64:
+                        d_aligned = d_aligned.with_columns(pl.lit(None).cast(pl.Float64).alias(mc))
+                    elif target_type == pl.Int64:
+                        d_aligned = d_aligned.with_columns(pl.lit(None).cast(pl.Int64).alias(mc))
+                    else:
+                        d_aligned = d_aligned.with_columns(pl.lit(None).cast(pl.Utf8).alias(mc))
+            
+            # Приводим существующие колонки к единому типу
+            for col in all_columns:
+                if col in d_aligned.columns:
+                    target_type = column_types.get(col, pl.Utf8)
+                    try:
+                        if target_type == pl.Float64:
+                            if d_aligned[col].dtype not in [pl.Float64, pl.Float32]:
+                                d_aligned = d_aligned.with_columns(
+                                    d_aligned[col].cast(pl.Float64, strict=False).fill_null(0.0)
+                                )
+                        elif target_type == pl.Int64:
+                            if d_aligned[col].dtype not in [pl.Int64, pl.Int32]:
+                                d_aligned = d_aligned.with_columns(
+                                    d_aligned[col].cast(pl.Int64, strict=False).fill_null(1)
+                                )
+                        else:
+                            if d_aligned[col].dtype not in [pl.Utf8]:
+                                d_aligned = d_aligned.with_columns(
+                                    d_aligned[col].cast(pl.Utf8, strict=False).fill_null("")
+                                )
+                    except Exception as e:
+                        logger.warning(f"Не удалось привести колонку {col} к типу {target_type}: {e}")
+            
+            # Выбираем колонки в отсортированном порядке
+            d_aligned = d_aligned.select(sorted(all_columns))
+            aligned_dfs.append(d_aligned)
+        
+        return aligned_dfs
+    
     def process_uploaded_files(self, uploaded_files_dict: Dict[str, Any]) -> Dict[str, pl.DataFrame]:
         """Обработка загруженных файлов с использованием временных файлов"""
         results = {}
         temp_dir = self.data_dir / "temp_uploads"
         temp_dir.mkdir(exist_ok=True)
         
-        for file_type, files in uploaded_files_dict.items():
+        # Разделяем файлы на universal и остальные типы
+        universal_files = uploaded_files_dict.pop('universal', [])
+        other_files = uploaded_files_dict
+        
+        # Сначала обрабатываем остальные типы файлов
+        for file_type, files in other_files.items():
             if not files:
                 continue
             
@@ -1152,82 +1281,87 @@ class HighVolumeAutoPartsCatalog:
             
             if dfs_for_type:
                 try:
-                    # ИСПРАВЛЕНИЕ: Выравнивание колонок перед объединением с учетом типов
-                    all_columns = set()
-                    for d in dfs_for_type:
-                        all_columns.update(d.columns)
-                    
-                    # Словарь для хранения типов колонок
-                    column_types = {}
-                    for d in dfs_for_type:
-                        for col in all_columns:
-                            if col in d.columns and col not in column_types:
-                                column_types[col] = d[col].dtype
-                            elif col not in d.columns and col not in column_types:
-                                # Определяем тип по умолчанию в зависимости от имени колонки
-                                if col in ['length', 'width', 'height', 'weight', 'price']:
-                                    column_types[col] = pl.Float64
-                                elif col in ['multiplicity']:
-                                    column_types[col] = pl.Int64
-                                elif col in ['oe_number', 'oe_number_norm', 'artikul', 'brand', 'artikul_norm', 'brand_norm', 'name', 'applicability', 'dimensions_str', 'image_url', 'barcode', 'description', 'category', 'Марка', 'Марка авто', 'Страна']:
-                                    column_types[col] = pl.Utf8
-                                else:
-                                    column_types[col] = pl.Utf8
-                    
-                    aligned_dfs = []
-                    for d in dfs_for_type:
-                        d_aligned = d
-                        # Добавляем отсутствующие колонки с правильными типами
-                        for mc in all_columns:
-                            if mc not in d.columns:
-                                target_type = column_types.get(mc, pl.Utf8)
-                                # Создаем колонку с NULL правильного типа
-                                if target_type == pl.Float64:
-                                    d_aligned = d_aligned.with_columns(pl.lit(None).cast(pl.Float64).alias(mc))
-                                elif target_type == pl.Int64:
-                                    d_aligned = d_aligned.with_columns(pl.lit(None).cast(pl.Int64).alias(mc))
-                                else:
-                                    d_aligned = d_aligned.with_columns(pl.lit(None).cast(pl.Utf8).alias(mc))
-                        
-                        # Приводим существующие колонки к единому типу
-                        for col in all_columns:
-                            if col in d_aligned.columns:
-                                target_type = column_types.get(col, pl.Utf8)
-                                try:
-                                    if target_type == pl.Float64:
-                                        if d_aligned[col].dtype not in [pl.Float64, pl.Float32]:
-                                            d_aligned = d_aligned.with_columns(
-                                                d_aligned[col].cast(pl.Float64, strict=False).fill_null(0.0)
-                                            )
-                                    elif target_type == pl.Int64:
-                                        if d_aligned[col].dtype not in [pl.Int64, pl.Int32]:
-                                            d_aligned = d_aligned.with_columns(
-                                                d_aligned[col].cast(pl.Int64, strict=False).fill_null(1)
-                                            )
-                                    else:
-                                        if d_aligned[col].dtype not in [pl.Utf8]:
-                                            d_aligned = d_aligned.with_columns(
-                                                d_aligned[col].cast(pl.Utf8, strict=False).fill_null("")
-                                            )
-                                except Exception as e:
-                                    logger.warning(f"Не удалось привести колонку {col} к типу {target_type}: {e}")
-                        
-                        # Выбираем только необходимые колонки в отсортированном порядке
-                        d_aligned = d_aligned.select(sorted(all_columns))
-                        aligned_dfs.append(d_aligned)
-                    
-                    # Объединяем все DataFrames
+                    aligned_dfs = self._align_dataframes_for_concat(dfs_for_type)
                     combined_df = pl.concat(aligned_dfs)
                     results[file_type] = combined_df.unique(keep='first')
                     logger.info(f"📦 Тип {file_type}: объединено {len(combined_df)} записей")
                 except Exception as e:
                     logger.error(f"Ошибка объединения DataFrame для {file_type}: {e}")
                     logger.exception("Детали ошибки объединения:")
-                    # Показать структуру каждого DataFrame для отладки
                     for i, d in enumerate(dfs_for_type):
                         logger.info(f"DataFrame {i} колонки: {d.columns}")
                         logger.info(f"DataFrame {i} типы: {d.schema}")
                     st.error(f"❌ Ошибка объединения файлов типа '{file_type}': {str(e)}")
+        
+        # Обработка universal-файлов с определением типа по содержимому
+        if universal_files:
+            logger.info(f"🔍 Обработка {len(universal_files)} универсальных файлов...")
+            
+            # Группируем файлы по фактическому типу данных
+            universal_groups = {
+                'oe': [],
+                'cross': [],
+                'prices': [],
+                'dimensions': [],
+                'barcode': [],
+                'images': []
+            }
+            
+            for idx, uploaded_file in enumerate(universal_files):
+                logger.info(f"Анализ универсального файла {idx + 1}/{len(universal_files)}: {uploaded_file.name}")
+                
+                with temp_upload_file(uploaded_file) as temp_path:
+                    try:
+                        # Читаем только заголовки для определения типа
+                        temp_df = self.read_and_prepare_file(str(temp_path), 'universal')
+                        
+                        if temp_df.is_empty():
+                            logger.warning(f"⚠️ Файл '{uploaded_file.name}' пуст, пропускаем")
+                            continue
+                        
+                        # Определяем тип по колонкам
+                        cols = set(c.lower() for c in temp_df.columns)
+                        detected_type = self._detect_file_type(cols)
+                        
+                        logger.info(f"📌 Файл '{uploaded_file.name}' определен как тип: {detected_type}")
+                        
+                        if detected_type != 'unknown':
+                            # Перечитываем файл с правильным типом
+                            with temp_upload_file(uploaded_file) as temp_path2:
+                                df = self.read_and_prepare_file(str(temp_path2), detected_type)
+                                if not df.is_empty():
+                                    universal_groups[detected_type].append(df)
+                                    logger.info(f"✅ Файл '{uploaded_file.name}' добавлен в группу {detected_type}")
+                                else:
+                                    logger.warning(f"⚠️ Файл '{uploaded_file.name}' не удалось прочитать с типом {detected_type}")
+                        else:
+                            # Если тип не определен, пробуем как OE
+                            with temp_upload_file(uploaded_file) as temp_path2:
+                                df = self.read_and_prepare_file(str(temp_path2), 'oe')
+                                if not df.is_empty():
+                                    universal_groups['oe'].append(df)
+                                    logger.info(f"✅ Файл '{uploaded_file.name}' добавлен в группу oe (как fallback)")
+                                else:
+                                    logger.warning(f"⚠️ Не удалось определить тип файла '{uploaded_file.name}'")
+                    
+                    except Exception as e:
+                        logger.exception(f"❌ Ошибка анализа файла '{uploaded_file.name}': {e}")
+                        st.error(f"❌ Ошибка обработки файла '{uploaded_file.name}': {str(e)}")
+            
+            # Обрабатываем каждую группу отдельно
+            for file_type, dfs in universal_groups.items():
+                if not dfs:
+                    continue
+                
+                try:
+                    aligned_dfs = self._align_dataframes_for_concat(dfs)
+                    combined_df = pl.concat(aligned_dfs)
+                    results[file_type] = combined_df.unique(keep='first')
+                    logger.info(f"📦 Универсальная группа {file_type}: объединено {len(combined_df)} записей")
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка объединения универсальных файлов для {file_type}: {e}")
+                    st.error(f"❌ Ошибка обработки универсальных файлов типа '{file_type}': {str(e)}")
         
         return results
     
@@ -1455,18 +1589,9 @@ class HighVolumeAutoPartsCatalog:
             return
         
         # Выравнивание колонок перед объединением
-        all_cols = set()
-        for d in parts_to_concat:
-            all_cols.update(d.columns)
-        
-        aligned_parts = []
-        for d in parts_to_concat:
-            missing = all_cols - set(d.columns)
-            d_aligned = d
-            for mc in missing:
-                d_aligned = d_aligned.with_columns(pl.lit(None).alias(mc))
-            d_aligned = d_aligned.select(sorted(all_cols))
-            aligned_parts.append(d_aligned)
+        aligned_parts = self._align_dataframes_for_concat(parts_to_concat)
+        if not aligned_parts:
+            return
         
         parts_df = pl.concat(aligned_parts).filter(
             pl.col('artikul_norm') != ""
@@ -2045,7 +2170,7 @@ class HighVolumeAutoPartsCatalog:
             raise
     
     # ========================================================================
-    # ПОИСК (С КЭШИРОВАНИЕМ)
+    # ПОИСК (С КЭШИРОВАНИЕМ И ПОИСКОМ ПО АНАЛОГАМ)
     # ========================================================================
     def _clean_search_cache(self):
         """Очистка устаревших записей кэша"""
@@ -2058,7 +2183,7 @@ class HighVolumeAutoPartsCatalog:
             del self._search_cache[k]
     
     def search_parts(self, query: str, limit: int = 100, use_cache: bool = True) -> pd.DataFrame:
-        """Улучшенный поиск с кэшированием и fallback"""
+        """Улучшенный поиск с кэшированием и поиском по аналогам"""
         if not query or not query.strip():
             return pd.DataFrame()
         
@@ -2075,8 +2200,21 @@ class HighVolumeAutoPartsCatalog:
         
         start_time = time.time()
         
-        # Поиск через LIKE с нормализацией
+        # Нормализация запроса
+        query_norm = self.normalize_key(pl.Series([query]))[0]
+        
+        # Основной поиск через LIKE
         result = self._search_like(query, limit)
+        
+        # Если результатов мало или нет, ищем по аналогам
+        if result is None or result.empty:
+            logger.info(f"🔍 Поиск по аналогам для запроса: {query}")
+            result = self._search_by_analog(query_norm, limit)
+        
+        # Если все еще нет результатов, ищем по OE номеру через кросс-ссылки
+        if result is None or result.empty:
+            logger.info(f"🔍 Поиск по OE номеру для запроса: {query}")
+            result = self._search_by_oe_number(query_norm, limit)
         
         # Сохранение в кэш
         if result is not None and not result.empty:
@@ -2126,6 +2264,108 @@ class HighVolumeAutoPartsCatalog:
             return self.conn.execute(sql_like, [safe_query, safe_query, safe_query, safe_query]).pl().to_pandas()
         except Exception as e:
             logger.error(f"Ошибка поиска LIKE: {e}")
+            return pd.DataFrame()
+    
+    def _search_by_analog(self, query_norm: str, limit: int) -> pd.DataFrame:
+        """
+        Поиск по аналогам: если запрос не найден напрямую, ищем через связи
+        """
+        sql_analog = f"""
+            WITH FoundParts AS (
+                SELECT DISTINCT p.artikul_norm, p.brand_norm
+                FROM parts p
+                LEFT JOIN cross_references cr ON p.artikul_norm = cr.artikul_norm AND p.brand_norm = cr.brand_norm
+                LEFT JOIN oe o ON cr.oe_number_norm = o.oe_number_norm
+                WHERE 
+                    p.artikul_norm LIKE '%' || ? || '%'
+                    OR p.brand_norm LIKE '%' || ? || '%'
+                    OR o.oe_number_norm LIKE '%' || ? || '%'
+                    OR o.name LIKE '%' || ? || '%'
+                LIMIT 10
+            ),
+            AnalogParts AS (
+                SELECT DISTINCT
+                    cr2.artikul_norm,
+                    cr2.brand_norm
+                FROM FoundParts fp
+                JOIN cross_references cr1 ON fp.artikul_norm = cr1.artikul_norm AND fp.brand_norm = cr1.brand_norm
+                JOIN cross_references cr2 ON cr1.oe_number_norm = cr2.oe_number_norm
+                WHERE NOT (cr2.artikul_norm = fp.artikul_norm AND cr2.brand_norm = fp.brand_norm)
+                LIMIT {limit}
+            )
+            SELECT DISTINCT
+                p.artikul,
+                p.brand,
+                p.description,
+                p.multiplicity,
+                p.length,
+                p.width,
+                p.height,
+                p.weight,
+                p.dimensions_str,
+                p.image_url,
+                STRING_AGG(DISTINCT o.oe_number, ', ') as oe_numbers,
+                STRING_AGG(DISTINCT o.name, ', ') as oe_names,
+                'найден по аналогу' as search_type
+            FROM AnalogParts ap
+            JOIN parts p ON ap.artikul_norm = p.artikul_norm AND ap.brand_norm = p.brand_norm
+            LEFT JOIN cross_references cr ON p.artikul_norm = cr.artikul_norm AND p.brand_norm = cr.brand_norm
+            LEFT JOIN oe o ON cr.oe_number_norm = o.oe_number_norm
+            GROUP BY p.artikul, p.brand, p.description, p.multiplicity,
+                     p.length, p.width, p.height, p.weight, p.dimensions_str, p.image_url
+            LIMIT {limit}
+        """
+        
+        try:
+            result = self.conn.execute(sql_analog, [query_norm, query_norm, query_norm, query_norm]).pl().to_pandas()
+            logger.info(f"🔍 Найдено {len(result)} аналогов для запроса: {query_norm}")
+            return result
+        except Exception as e:
+            logger.error(f"Ошибка поиска по аналогам: {e}")
+            return pd.DataFrame()
+    
+    def _search_by_oe_number(self, query_norm: str, limit: int) -> pd.DataFrame:
+        """
+        Поиск по OE номеру через кросс-ссылки
+        """
+        sql_oe = f"""
+            WITH OEParts AS (
+                SELECT DISTINCT
+                    cr.artikul_norm,
+                    cr.brand_norm
+                FROM cross_references cr
+                WHERE cr.oe_number_norm LIKE '%' || ? || '%'
+                LIMIT {limit}
+            )
+            SELECT DISTINCT
+                p.artikul,
+                p.brand,
+                p.description,
+                p.multiplicity,
+                p.length,
+                p.width,
+                p.height,
+                p.weight,
+                p.dimensions_str,
+                p.image_url,
+                STRING_AGG(DISTINCT o.oe_number, ', ') as oe_numbers,
+                STRING_AGG(DISTINCT o.name, ', ') as oe_names,
+                'найден по OE' as search_type
+            FROM OEParts op
+            JOIN parts p ON op.artikul_norm = p.artikul_norm AND op.brand_norm = p.brand_norm
+            LEFT JOIN cross_references cr ON p.artikul_norm = cr.artikul_norm AND p.brand_norm = cr.brand_norm
+            LEFT JOIN oe o ON cr.oe_number_norm = o.oe_number_norm
+            GROUP BY p.artikul, p.brand, p.description, p.multiplicity,
+                     p.length, p.width, p.height, p.weight, p.dimensions_str, p.image_url
+            LIMIT {limit}
+        """
+        
+        try:
+            result = self.conn.execute(sql_oe, [query_norm]).pl().to_pandas()
+            logger.info(f"🔍 Найдено {len(result)} записей по OE номеру: {query_norm}")
+            return result
+        except Exception as e:
+            logger.error(f"Ошибка поиска по OE: {e}")
             return pd.DataFrame()
     
     # ========================================================================
@@ -3470,9 +3710,13 @@ def main():
                 else:
                     st.success(f"✅ Найдено {len(results_df)} записей")
                     
+                    # Проверяем, есть ли колонка search_type (для отображения способа поиска)
+                    if 'search_type' in results_df.columns:
+                        st.caption(f"🔍 Способ поиска: {results_df['search_type'].iloc[0] if not results_df.empty else 'прямой'}")
+                    
                     # Настройка отображения колонок
                     available_cols = [c for c in results_df.columns 
-                                    if c not in ['artikul_norm', 'brand_norm']]
+                                    if c not in ['artikul_norm', 'brand_norm', 'search_type']]
                     
                     st.dataframe(
                         results_df[available_cols],
