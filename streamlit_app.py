@@ -1152,25 +1152,80 @@ class HighVolumeAutoPartsCatalog:
             
             if dfs_for_type:
                 try:
-                    # ИСПРАВЛЕНИЕ: Выравнивание колонок перед объединением
+                    # ИСПРАВЛЕНИЕ: Выравнивание колонок перед объединением с учетом типов
                     all_columns = set()
                     for d in dfs_for_type:
                         all_columns.update(d.columns)
                     
+                    # Словарь для хранения типов колонок
+                    column_types = {}
+                    for d in dfs_for_type:
+                        for col in all_columns:
+                            if col in d.columns and col not in column_types:
+                                column_types[col] = d[col].dtype
+                            elif col not in d.columns and col not in column_types:
+                                # Определяем тип по умолчанию в зависимости от имени колонки
+                                if col in ['length', 'width', 'height', 'weight', 'price']:
+                                    column_types[col] = pl.Float64
+                                elif col in ['multiplicity']:
+                                    column_types[col] = pl.Int64
+                                else:
+                                    column_types[col] = pl.Utf8
+                    
                     aligned_dfs = []
                     for d in dfs_for_type:
-                        missing_cols = all_columns - set(d.columns)
                         d_aligned = d
-                        for mc in missing_cols:
-                            d_aligned = d_aligned.with_columns(pl.lit(None).alias(mc))
+                        # Добавляем отсутствующие колонки с правильными типами
+                        for mc in all_columns:
+                            if mc not in d.columns:
+                                target_type = column_types.get(mc, pl.Utf8)
+                                # Создаем колонку с NULL правильного типа
+                                if target_type == pl.Float64:
+                                    d_aligned = d_aligned.with_columns(pl.lit(None).cast(pl.Float64).alias(mc))
+                                elif target_type == pl.Int64:
+                                    d_aligned = d_aligned.with_columns(pl.lit(None).cast(pl.Int64).alias(mc))
+                                else:
+                                    d_aligned = d_aligned.with_columns(pl.lit(None).cast(pl.Utf8).alias(mc))
+                        
+                        # Приводим существующие колонки к единому типу
+                        for col in all_columns:
+                            if col in d_aligned.columns:
+                                target_type = column_types.get(col, pl.Utf8)
+                                try:
+                                    if target_type == pl.Float64:
+                                        if d_aligned[col].dtype not in [pl.Float64, pl.Float32]:
+                                            d_aligned = d_aligned.with_columns(
+                                                d_aligned[col].cast(pl.Float64, strict=False).fill_null(0.0)
+                                            )
+                                    elif target_type == pl.Int64:
+                                        if d_aligned[col].dtype not in [pl.Int64, pl.Int32]:
+                                            d_aligned = d_aligned.with_columns(
+                                                d_aligned[col].cast(pl.Int64, strict=False).fill_null(1)
+                                            )
+                                    else:
+                                        if d_aligned[col].dtype not in [pl.Utf8]:
+                                            d_aligned = d_aligned.with_columns(
+                                                d_aligned[col].cast(pl.Utf8, strict=False).fill_null("")
+                                            )
+                                except Exception as e:
+                                    logger.warning(f"Не удалось привести колонку {col} к типу {target_type}: {e}")
+                        
+                        # Выбираем только необходимые колонки в отсортированном порядке
                         d_aligned = d_aligned.select(sorted(all_columns))
                         aligned_dfs.append(d_aligned)
                     
+                    # Объединяем все DataFrames
                     combined_df = pl.concat(aligned_dfs)
                     results[file_type] = combined_df.unique(keep='first')
                     logger.info(f"📦 Тип {file_type}: объединено {len(combined_df)} записей")
                 except Exception as e:
                     logger.error(f"Ошибка объединения DataFrame для {file_type}: {e}")
+                    logger.exception("Детали ошибки объединения:")
+                    # Показать структуру каждого DataFrame для отладки
+                    for i, d in enumerate(dfs_for_type):
+                        logger.info(f"DataFrame {i} колонки: {d.columns}")
+                        logger.info(f"DataFrame {i} типы: {d.schema}")
+                    st.error(f"❌ Ошибка объединения файлов типа '{file_type}': {str(e)}")
         
         return results
     
