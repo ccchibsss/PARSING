@@ -11,16 +11,20 @@ import tempfile
 import functools
 import shutil
 import platform
+import zipfile
 from datetime import datetime, date, timedelta
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple, Set
+from typing import Dict, List, Any, Optional, Tuple, Set, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+import itertools
 
 import streamlit as st
 import duckdb
 import polars as pl
 import pandas as pd
+import yaml
+from jinja2 import Template, Environment, BaseLoader
 
 # ============================================================================
 # НАСТРОЙКА ЛОГИРОВАНИЯ
@@ -56,6 +60,102 @@ EXCEL_ROW_LIMIT = 1048575
 # Размер батча для обработки
 BATCH_SIZE = 100_000
 
+# ============================================================================
+# КОНФИГУРАЦИЯ КОЛОНОК ДЛЯ РАЗНЫХ ФОРМАТОВ
+# ============================================================================
+class ExportColumnConfig:
+    """Конфигурация колонок для разных форматов выгрузки"""
+    
+    # Стандартные колонки для всех форматов
+    STANDARD_COLUMNS = [
+        "Артикул", "Артикул (SKU)", "Артикул производителя", "Артикул товара (SKU)",
+        "Название товара", "Название", "Бренд", "Производитель",
+        "Описание товара", "Описание", "Категория", "Категория на Маркете",
+        "Цена", "Цена со скидкой", "Зачёркнутая цена", "Себестоимость",
+        "Длина, см", "Ширина, см", "Высота, см", "Вес, кг",
+        "Применимость", "OE номер", "Кроссы", "Аналоги",
+        "Ссылка на изображение", "Дополнительные изображения",
+        "Штрихкод", "EAN", "Штрих-код",
+        "Наличие", "Кратность", "Мин. партия",
+        "Страна производства", "Гарантийный срок", "Срок годности",
+        "Артикул Маркета", "Категория Yandex", "Категория Ozon",
+        "Теги", "Ссылка на видео", "Инструкции",
+        "Состояние", "Описание состояния", "Тип уценки",
+        "Дата добавления", "Дата обновления"
+    ]
+    
+    # Специфичные для Яндекс.Маркет
+    YANDEX_COLUMNS = [
+        "offer id", "Название", "Ссылка на изображение", "Описание",
+        "Категория Yandex", "Бренд", "EAN", "Вес", "Цена",
+        "Мин. партия", "Наличие", "Длина", "Ширина", "Высота",
+        "Применимость", "Кроссы", "Дополнительные изображения"
+    ]
+    
+    # Специфичные для Ozon
+    OZON_COLUMNS = [
+        "Артикул товара (SKU)", "Название товара", "Ссылка на изображение",
+        "Описание товара", "Категория Ozon", "Бренд", "Штрихкод",
+        "Вес, кг", "Длина, см", "Ширина, см", "Высота, см",
+        "Цена", "Зачёркнутая цена", "Артикул производителя",
+        "Страна производства", "Гарантийный срок", "Срок годности"
+    ]
+    
+    # Специфичные для Avito
+    AVITO_COLUMNS = [
+        "Артикул", "Название", "Описание", "Цена",
+        "Бренд", "Категория", "Состояние",
+        "Длина, см", "Ширина, см", "Высота, см", "Вес, кг",
+        "Ссылка на изображение", "Применимость", "Гарантийный срок"
+    ]
+    
+    # Специфичные для СберМегаМаркет
+    SBER_COLUMNS = [
+        "Артикул товара (SKU)", "Название товара", "Описание товара",
+        "Цена", "Бренд", "Категория на Маркете", "Ссылка на изображение",
+        "Штрихкод", "Длина, см", "Ширина, см", "Высота, см", "Вес, кг",
+        "Страна производства", "Гарантийный срок", "Артикул производителя"
+    ]
+    
+    # Все колонки для пользовательского выбора
+    ALL_COLUMNS = {
+        "Основные": [
+            "Артикул", "Артикул (SKU)", "Артикул производителя", "Артикул товара (SKU)",
+            "Название товара", "Название", "Описание товара", "Описание"
+        ],
+        "Бренды и категории": [
+            "Бренд", "Производитель", "Категория", "Категория на Маркете", 
+            "Категория Yandex", "Категория Ozon"
+        ],
+        "Цены": [
+            "Цена", "Цена со скидкой", "Зачёркнутая цена", "Себестоимость",
+            "Дополнительные расходы", "Валюта"
+        ],
+        "Размеры": [
+            "Длина, см", "Ширина, см", "Высота, см", "Вес, кг",
+            "Длина", "Ширина", "Высота", "Вес"
+        ],
+        "Идентификация": [
+            "Штрихкод", "EAN", "Штрих-код", "OE номер", "Кроссы", "Аналоги",
+            "Артикул Маркета", "offer id"
+        ],
+        "Изображения": [
+            "Ссылка на изображение", "Дополнительные изображения", "Ссылка на видео"
+        ],
+        "Склады и наличие": [
+            "Наличие", "Кратность", "Мин. партия", "Товар доставляется в нескольких упаковках"
+        ],
+        "Дополнительная информация": [
+            "Применимость", "Страна производства", "Гарантийный срок", "Срок годности",
+            "Срок службы", "Комментарий к гарантийному сроку", "Комментарий к сроку годности",
+            "Комментарий к сроку службы", "Инструкции", "Теги", "Состояние",
+            "Описание состояния", "Тип уценки", "Внешний вид товара",
+            "Особый тип товара", "С какого возраста пользоваться", "Товар для взрослых",
+            "Цифровой товар", "Характеристики товара", "В архиве",
+            "Дата дополнения карточки", "Дата добавления", "Дата обновления",
+            "Номер документа на товар", "Код ТН ВЭД", "Буду маркировать"
+        ]
+    }
 
 # ============================================================================
 # ДЕКОРАТОРЫ И УТИЛИТЫ
@@ -70,7 +170,6 @@ def timing_decorator(func):
         logger.info(f"⏱️ {func.__name__} выполнилась за {elapsed:.2f} сек")
         return result
     return wrapper
-
 
 def get_memory_usage() -> float:
     """Получение использования памяти без psutil"""
@@ -95,13 +194,11 @@ def get_memory_usage() -> float:
     
     return 0.0
 
-
 def memory_monitor():
     """Мониторинг использования памяти"""
     mem_mb = get_memory_usage()
     logger.info(f"💾 Использование памяти: {mem_mb:.1f} МБ")
     return mem_mb
-
 
 @contextmanager
 def temp_upload_file(uploaded_file):
@@ -119,9 +216,565 @@ def temp_upload_file(uploaded_file):
         except Exception as e:
             logger.warning(f"Не удалось удалить временный файл: {e}")
 
+# ============================================================================
+# ДВИЖОК ШАБЛОНОВ
+# ============================================================================
+class TemplateEngine:
+    """Движок для генерации контента по шаблонам с поддержкой Liquid-синтаксиса"""
+    
+    def __init__(self):
+        self.env = Environment(loader=BaseLoader())
+    
+    def render(self, template_str: str, context: Dict[str, Any]) -> str:
+        """Рендеринг шаблона с контекстом"""
+        if not template_str:
+            return ""
+        
+        try:
+            template = self.env.from_string(template_str)
+            return template.render(**context)
+        except Exception as e:
+            logger.error(f"Ошибка рендеринга шаблона: {e}")
+            return template_str
+    
+    def get_default_name_template(self) -> str:
+        """Шаблон названия по умолчанию"""
+        return "{{detail_name}} Артикул - {{oem}} / Бренд - {{make_name}} / комплект - {{min_qnt}} шт."
+    
+    def get_default_description_template(self) -> str:
+        """Шаблон описания по умолчанию"""
+        return """{{detail_name}}
+Характеристики:
+Артикул - {{oem}}
+Бренд - {{make_name}}
+Комплект - {{min_qnt}} шт.
+Состояние товара: новый (в упаковке)
+{{product_description}}"""
+    
+    def build_context(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Построение контекста из строки данных"""
+        context = {
+            # Основные поля
+            'oem': row.get('Артикул', '') or row.get('Артикул (SKU)', '') or row.get('offer id', ''),
+            'source_oem': row.get('Артикул производителя', '') or row.get('Артикул товара (SKU)', ''),
+            'make_name': row.get('Бренд', '') or row.get('Производитель', ''),
+            'detail_name': row.get('Название товара', '') or row.get('Название', ''),
+            'description': row.get('Описание товара', '') or row.get('Описание', ''),
+            
+            # Кроссы и коды
+            'cross': row.get('Кроссы', '') or row.get('Аналоги', ''),
+            'barcode': row.get('Штрихкод', '') or row.get('EAN', '') or row.get('Штрих-код', ''),
+            
+            # Количество
+            'qnt': row.get('Наличие', 0) or row.get('Количество', 0),
+            'min_qnt': row.get('Кратность', 1) or row.get('Мин. партия', 1),
+            
+            # Цены
+            'price': row.get('Цена', 0),
+            'currency': row.get('Валюта', 'RUB'),
+            
+            # Размеры
+            'length': row.get('Длина, см', 0) or row.get('Длина', 0),
+            'width': row.get('Ширина, см', 0) or row.get('Ширина', 0),
+            'height': row.get('Высота, см', 0) or row.get('Высота', 0),
+            'weight': row.get('Вес, кг', 0) or row.get('Вес', 0),
+            
+            # Изображения
+            'image_url': row.get('Ссылка на изображение', ''),
+            'additional_images': row.get('Дополнительные изображения', ''),
+            
+            # Категории
+            'category': row.get('Категория', '') or row.get('Категория на Маркете', ''),
+            'category_yandex': row.get('Категория Yandex', ''),
+            'category_ozon': row.get('Категория Ozon', ''),
+            
+            # Применимость
+            'applicability': row.get('Применимость', ''),
+            
+            # Прочее
+            'manufacturer': row.get('Производитель', ''),
+            'country': row.get('Страна производства', ''),
+            'warranty': row.get('Гарантийный срок', ''),
+            'shelf_life': row.get('Срок годности', ''),
+            'service_life': row.get('Срок службы', ''),
+            'sku': row.get('Артикул (SKU)', ''),
+            
+            # Описания для разных площадок
+            'product_description': row.get('Описание товара', ''),
+            'ymarket_description': row.get('Описание товара', ''),
+            'ozon_description': row.get('Описание товара', ''),
+            'avito_description': row.get('Описание товара', ''),
+            'sbermegamarket_description': row.get('Описание товара', ''),
+            'google_description': row.get('Описание товара', ''),
+            'aliexpress_description': row.get('Описание товара', ''),
+            
+            # Свойства (1-6)
+            'properties_1': row.get('Свойство 1', ''),
+            'properties_2': row.get('Свойство 2', ''),
+            'properties_3': row.get('Свойство 3', ''),
+            'properties_4': row.get('Свойство 4', ''),
+            'properties_5': row.get('Свойство 5', ''),
+            'properties_6': row.get('Свойство 6', ''),
+        }
+        
+        return context
 
 # ============================================================================
-# БЛОК 1: HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ПОЛНАЯ ВЕРСИЯ v200.2)
+# ОБРАБОТЧИК ЭКСПОРТА
+# ============================================================================
+class ExportHandler:
+    """Обработчик экспорта с поддержкой всех форматов и настроек"""
+    
+    def __init__(self, catalog):
+        self.catalog = catalog
+        self.template_engine = TemplateEngine()
+        self.column_config = ExportColumnConfig()
+    
+    def get_columns_for_format(self, format_type: str) -> List[str]:
+        """Получение списка колонок для формата"""
+        format_map = {
+            'yandex': self.column_config.YANDEX_COLUMNS,
+            'ozon': self.column_config.OZON_COLUMNS,
+            'avito': self.column_config.AVITO_COLUMNS,
+            'sber': self.column_config.SBER_COLUMNS,
+        }
+        return format_map.get(format_type, self.column_config.STANDARD_COLUMNS)
+    
+    @timing_decorator
+    def export_data(
+        self,
+        output_path: str,
+        selected_columns: Optional[List[str]] = None,
+        include_prices: bool = True,
+        apply_markup: bool = True,
+        apply_exclusions: bool = True,
+        format_type: str = 'csv',
+        market_format: Optional[str] = None,
+        template_name: Optional[str] = None,
+        template_description: Optional[str] = None,
+        csv_separator: str = ';',
+        decimal_separator: str = '.',
+        encoding: str = 'windows-1251',
+        add_apostrophe: bool = True,
+        use_crlf: bool = True,
+        remove_semicolon: bool = False,
+        split_size: int = 500000,
+        zip_archive: bool = False,
+        **kwargs
+    ) -> bool:
+        """
+        Основной метод экспорта с поддержкой всех настроек
+        """
+        # Получение данных
+        query = self.catalog.build_export_query(
+            selected_columns, include_prices, apply_markup, apply_exclusions
+        )
+        
+        total = self.catalog.conn.execute(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts)"
+        ).fetchone()[0]
+        
+        if total == 0:
+            logger.warning("Нет данных для экспорта")
+            return False
+        
+        logger.info(f"📤 Экспорт {total:,} записей в {format_type.upper()}...")
+        
+        try:
+            # Получение данных чанками если нужно
+            if split_size > 0 and total > split_size:
+                return self._export_chunked(
+                    query, output_path, total, split_size,
+                    selected_columns, market_format,
+                    template_name, template_description,
+                    csv_separator, decimal_separator, encoding,
+                    add_apostrophe, use_crlf, remove_semicolon,
+                    zip_archive, format_type
+                )
+            else:
+                # Обычный экспорт
+                df = self.catalog.conn.execute(query).pl()
+                
+                # Применение шаблонов
+                if template_name or template_description:
+                    df = self._apply_templates(df, template_name, template_description)
+                
+                # Преобразование в нужный формат
+                if market_format:
+                    df = self._format_for_marketplace(df, market_format)
+                
+                # Применение настроек форматирования
+                df = self._apply_formatting(
+                    df, csv_separator, decimal_separator,
+                    add_apostrophe, remove_semicolon
+                )
+                
+                # Сохранение
+                if format_type == 'csv':
+                    return self._save_csv(df, output_path, csv_separator, encoding, use_crlf)
+                elif format_type == 'xlsx':
+                    return self._save_excel(df, output_path)
+                elif format_type == 'json':
+                    return self._save_json(df, output_path)
+                else:
+                    return self._save_csv(df, output_path, csv_separator, encoding, use_crlf)
+        
+        except Exception as e:
+            logger.exception("Ошибка экспорта")
+            return False
+    
+    def _apply_templates(self, df: pl.DataFrame, 
+                        name_template: Optional[str],
+                        desc_template: Optional[str]) -> pl.DataFrame:
+        """Применение шаблонов к данным"""
+        if not name_template and not desc_template:
+            return df
+        
+        # Конвертация в список словарей для рендеринга
+        rows = df.rows(named=True)
+        processed_rows = []
+        
+        for row in rows:
+            context = self.template_engine.build_context(row)
+            
+            if name_template:
+                row['Сгенерированное название'] = self.template_engine.render(name_template, context)
+            
+            if desc_template:
+                row['Сгенерированное описание'] = self.template_engine.render(desc_template, context)
+            
+            processed_rows.append(row)
+        
+        return pl.DataFrame(processed_rows)
+    
+    def _format_for_marketplace(self, df: pl.DataFrame, market_format: str) -> pl.DataFrame:
+        """Форматирование данных для конкретного маркетплейса"""
+        rows = df.rows(named=True)
+        formatted_rows = []
+        
+        for row in rows:
+            formatted = self._format_row_for_marketplace(row, market_format)
+            formatted_rows.append(formatted)
+        
+        return pl.DataFrame(formatted_rows)
+    
+    def _format_row_for_marketplace(self, row: Dict[str, Any], market_format: str) -> Dict[str, Any]:
+        """Форматирование одной строки для маркетплейса"""
+        if market_format == 'yandex':
+            return {
+                'offer id': row.get('Артикул', ''),
+                'Название': row.get('Сгенерированное название', row.get('Название товара', '')),
+                'Ссылка на изображение': row.get('Ссылка на изображение', ''),
+                'Описание': row.get('Сгенерированное описание', row.get('Описание товара', '')),
+                'Категория Yandex': row.get('Категория Yandex', row.get('Категория', '')),
+                'Бренд': row.get('Бренд', ''),
+                'EAN': row.get('Штрихкод', ''),
+                'Вес': row.get('Вес, кг', 0),
+                'Цена': row.get('Цена', 0),
+                'Мин. партия': row.get('Кратность', 1),
+                'Наличие': row.get('Наличие', 0),
+                'Длина': row.get('Длина, см', 0),
+                'Ширина': row.get('Ширина, см', 0),
+                'Высота': row.get('Высота, см', 0),
+                'Применимость': row.get('Применимость', ''),
+                'Кроссы': row.get('Кроссы', ''),
+                'Дополнительные изображения': row.get('Дополнительные изображения', '')
+            }
+        
+        elif market_format == 'ozon':
+            return {
+                'Артикул товара (SKU)': row.get('Артикул (SKU)', ''),
+                'Название товара': row.get('Сгенерированное название', row.get('Название товара', '')),
+                'Ссылка на изображение': row.get('Ссылка на изображение', ''),
+                'Описание товара': row.get('Сгенерированное описание', row.get('Описание товара', '')),
+                'Категория Ozon': row.get('Категория Ozon', row.get('Категория', '')),
+                'Бренд': row.get('Бренд', ''),
+                'Штрихкод': row.get('Штрихкод', ''),
+                'Вес, кг': row.get('Вес, кг', 0),
+                'Длина, см': row.get('Длина, см', 0),
+                'Ширина, см': row.get('Ширина, см', 0),
+                'Высота, см': row.get('Высота, см', 0),
+                'Цена': row.get('Цена', 0),
+                'Зачёркнутая цена': row.get('Зачёркнутая цена', 0),
+                'Артикул производителя': row.get('Артикул производителя', ''),
+                'Страна производства': row.get('Страна производства', ''),
+                'Гарантийный срок': row.get('Гарантийный срок', ''),
+                'Срок годности': row.get('Срок годности', '')
+            }
+        
+        elif market_format == 'avito':
+            return {
+                'Артикул': row.get('Артикул', ''),
+                'Название': row.get('Сгенерированное название', row.get('Название товара', '')),
+                'Описание': row.get('Сгенерированное описание', row.get('Описание товара', '')),
+                'Цена': row.get('Цена', 0),
+                'Бренд': row.get('Бренд', ''),
+                'Категория': row.get('Категория', ''),
+                'Состояние': row.get('Состояние', 'Новый'),
+                'Длина, см': row.get('Длина, см', 0),
+                'Ширина, см': row.get('Ширина, см', 0),
+                'Высота, см': row.get('Высота, см', 0),
+                'Вес, кг': row.get('Вес, кг', 0),
+                'Ссылка на изображение': row.get('Ссылка на изображение', ''),
+                'Применимость': row.get('Применимость', ''),
+                'Гарантийный срок': row.get('Гарантийный срок', '')
+            }
+        
+        elif market_format == 'sber':
+            return {
+                'Артикул товара (SKU)': row.get('Артикул (SKU)', ''),
+                'Название товара': row.get('Сгенерированное название', row.get('Название товара', '')),
+                'Описание товара': row.get('Сгенерированное описание', row.get('Описание товара', '')),
+                'Цена': row.get('Цена', 0),
+                'Бренд': row.get('Бренд', ''),
+                'Категория на Маркете': row.get('Категория', ''),
+                'Ссылка на изображение': row.get('Ссылка на изображение', ''),
+                'Штрихкод': row.get('Штрихкод', ''),
+                'Длина, см': row.get('Длина, см', 0),
+                'Ширина, см': row.get('Ширина, см', 0),
+                'Высота, см': row.get('Высота, см', 0),
+                'Вес, кг': row.get('Вес, кг', 0),
+                'Страна производства': row.get('Страна производства', ''),
+                'Гарантийный срок': row.get('Гарантийный срок', ''),
+                'Артикул производителя': row.get('Артикул производителя', '')
+            }
+        
+        else:
+            return row
+    
+    def _apply_formatting(
+        self,
+        df: pl.DataFrame,
+        csv_separator: str,
+        decimal_separator: str,
+        add_apostrophe: bool,
+        remove_semicolon: bool
+    ) -> pl.DataFrame:
+        """Применение форматирования к данным"""
+        # Конвертация в Pandas для более гибкой работы
+        pdf = df.to_pandas()
+        
+        # Обработка колонок с артикулами
+        artikel_cols = ['Артикул', 'Артикул (SKU)', 'Артикул производителя', 'Артикул товара (SKU)', 'offer id']
+        for col in artikel_cols:
+            if col in pdf.columns:
+                pdf[col] = pdf[col].astype(str)
+                if add_apostrophe:
+                    pdf[col] = pdf[col].apply(lambda x: f"'{x}" if x and x != 'nan' else x)
+                else:
+                    # Добавление разделителя для номеров с E
+                    pdf[col] = pdf[col].apply(self._safe_format_artikul)
+        
+        # Удаление точек с запятой из текста
+        if remove_semicolon:
+            for col in pdf.select_dtypes(include=['object']).columns:
+                pdf[col] = pdf[col].astype(str).str.replace(';', ' ', regex=False)
+        
+        # Замена десятичного разделителя
+        if decimal_separator == ',':
+            for col in pdf.select_dtypes(include=['float', 'int']).columns:
+                pdf[col] = pdf[col].astype(str).str.replace('.', ',')
+        
+        return pl.from_pandas(pdf)
+    
+    def _safe_format_artikul(self, value: str) -> str:
+        """Безопасное форматирование артикула"""
+        if not value or value == 'nan':
+            return ''
+        
+        # Если номер содержит E и цифры, добавляем разделитель
+        if re.match(r'^\d+E\d+$', value, re.IGNORECASE):
+            parts = re.split(r'(E)', value, flags=re.IGNORECASE)
+            if len(parts) >= 3:
+                return f"{parts[0]}-{parts[1]}{parts[2]}"
+        
+        return value
+    
+    def _export_chunked(
+        self,
+        query: str,
+        output_path: str,
+        total: int,
+        chunk_size: int,
+        selected_columns: Optional[List[str]],
+        market_format: Optional[str],
+        template_name: Optional[str],
+        template_description: Optional[str],
+        csv_separator: str,
+        decimal_separator: str,
+        encoding: str,
+        add_apostrophe: bool,
+        use_crlf: bool,
+        remove_semicolon: bool,
+        zip_archive: bool,
+        format_type: str
+    ) -> bool:
+        """Чанковый экспорт с разбиением на части"""
+        output_path = Path(output_path)
+        base_name = output_path.stem
+        output_dir = output_path.parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        chunks = (total // chunk_size) + 1
+        files_created = []
+        
+        progress_bar = st.progress(0) if 'st' in globals() else None
+        status_text = st.empty() if 'st' in globals() else None
+        
+        logger.info(f"Разбиение экспорта на {chunks} частей по {chunk_size:,} записей")
+        
+        for i in range(chunks):
+            offset = i * chunk_size
+            chunk_query = f"{query} LIMIT {chunk_size} OFFSET {offset}"
+            
+            # Проверка, есть ли данные в чанке
+            count_query = f"SELECT COUNT(*) FROM ({chunk_query})"
+            count = self.catalog.conn.execute(count_query).fetchone()[0]
+            
+            if count == 0:
+                break
+            
+            df = self.catalog.conn.execute(chunk_query).pl()
+            
+            # Применение шаблонов
+            if template_name or template_description:
+                df = self._apply_templates(df, template_name, template_description)
+            
+            # Форматирование для маркетплейса
+            if market_format:
+                df = self._format_for_marketplace(df, market_format)
+            
+            # Применение форматирования
+            df = self._apply_formatting(
+                df, csv_separator, decimal_separator,
+                add_apostrophe, remove_semicolon
+            )
+            
+            # Имя файла
+            part_name = f"{base_name}_part_{i+1:03d}"
+            if format_type == 'csv':
+                part_path = output_dir / f"{part_name}.csv"
+                self._save_csv(df, str(part_path), csv_separator, encoding, use_crlf)
+            elif format_type == 'xlsx':
+                part_path = output_dir / f"{part_name}.xlsx"
+                self._save_excel(df, str(part_path))
+            elif format_type == 'json':
+                part_path = output_dir / f"{part_name}.json"
+                self._save_json(df, str(part_path))
+            else:
+                part_path = output_dir / f"{part_name}.csv"
+                self._save_csv(df, str(part_path), csv_separator, encoding, use_crlf)
+            
+            files_created.append(part_path)
+            
+            # Обновление прогресса
+            progress = (i + 1) / chunks
+            if progress_bar:
+                progress_bar.progress(progress)
+            if status_text:
+                status_text.text(f"📤 Экспорт чанка {i + 1}/{chunks}...")
+            
+            logger.info(f"✅ Чанк {i+1}/{chunks} создан: {part_path.name} ({count:,} записей)")
+        
+        # Если нужен архив
+        if zip_archive and len(files_created) > 1:
+            archive_path = output_dir / f"{base_name}.zip"
+            with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for file_path in files_created:
+                    zipf.write(file_path, file_path.name)
+                    file_path.unlink()  # Удаляем оригинальный файл
+            
+            logger.info(f"📦 Создан архив: {archive_path.name}")
+            
+            if 'st' in globals():
+                st.success(f"✅ Экспорт завершен! Архив: {archive_path.name}")
+            
+            return True
+        
+        elif len(files_created) == 1:
+            # Перемещаем единственный файл в выходной путь
+            if str(files_created[0]) != str(output_path):
+                shutil.move(str(files_created[0]), str(output_path))
+            
+            if 'st' in globals():
+                st.success(f"✅ Экспорт завершен: {output_path.name}")
+            
+            return True
+        
+        if 'st' in globals():
+            st.success(f"✅ Экспорт завершен! Создано {len(files_created)} файлов")
+        
+        return True
+    
+    def _save_csv(self, df: pl.DataFrame, output_path: str, separator: str, 
+                 encoding: str, use_crlf: bool) -> bool:
+        """Сохранение в CSV с правильными параметрами"""
+        try:
+            pdf = df.to_pandas()
+            
+            # Запись с BOM для Windows
+            buf = io.StringIO()
+            pdf.to_csv(buf, sep=separator, index=False, 
+                      line_terminator='\r\n' if use_crlf else '\n')
+            
+            with open(output_path, "wb") as f:
+                if encoding.lower() == 'windows-1251':
+                    f.write(b'\xef\xbb\xbf')
+                f.write(buf.getvalue().encode(encoding))
+            
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            logger.info(f"✅ CSV сохранен: {Path(output_path).name} ({size_mb:.1f} МБ)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка сохранения CSV: {e}")
+            return False
+    
+    def _save_excel(self, df: pl.DataFrame, output_path: str) -> bool:
+        """Сохранение в Excel"""
+        try:
+            pdf = df.to_pandas()
+            
+            if len(pdf) <= EXCEL_ROW_LIMIT:
+                with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                    pdf.to_excel(writer, index=False, sheet_name='Данные')
+            else:
+                # Разбиение на несколько листов
+                sheets = (len(pdf) // EXCEL_ROW_LIMIT) + 1
+                with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                    for i in range(sheets):
+                        start_idx = i * EXCEL_ROW_LIMIT
+                        end_idx = min((i + 1) * EXCEL_ROW_LIMIT, len(pdf))
+                        pdf.iloc[start_idx:end_idx].to_excel(
+                            writer, index=False, sheet_name=f"Данные_{i+1}"
+                        )
+            
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            logger.info(f"✅ Excel сохранен: {Path(output_path).name} ({size_mb:.1f} МБ)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка сохранения Excel: {e}")
+            return False
+    
+    def _save_json(self, df: pl.DataFrame, output_path: str) -> bool:
+        """Сохранение в JSON"""
+        try:
+            data = df.to_pandas().to_dict(orient='records')
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            logger.info(f"✅ JSON сохранен: {Path(output_path).name} ({size_mb:.1f} МБ)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка сохранения JSON: {e}")
+            return False
+
+# ============================================================================
+# HIGH-VOLUME КАТАЛОГ АВТОЗАПЧАСТЕЙ (ОБНОВЛЕННАЯ ВЕРСИЯ)
 # ============================================================================
 class HighVolumeAutoPartsCatalog:
     """
@@ -131,7 +784,9 @@ class HighVolumeAutoPartsCatalog:
     - Интеллектуального маппинга колонок
     - Расширенного управления связями
     - Кэширования запросов
-    - Мониторинга производительности
+    - Экспорта в форматы маркетплейсов
+    - Шаблонов названий и описаний
+    - Настраиваемых колонок
     """
     
     def __init__(self):
@@ -162,6 +817,9 @@ class HighVolumeAutoPartsCatalog:
             'cache_hits': 0,
             'total_time': 0.0
         }
+        
+        # Экспорт обработчик
+        self.export_handler = ExportHandler(self)
     
     def _init_duckdb(self) -> duckdb.DuckDBPyConnection:
         """Инициализация DuckDB с оптимизациями производительности"""
@@ -182,7 +840,7 @@ class HighVolumeAutoPartsCatalog:
         return conn
     
     # ========================================================================
-    # КОНФИГУРАЦИИ
+    # КОНФИГУРАЦИИ (СОХРАНЕНЫ ИЗ ПРЕДЫДУЩЕЙ ВЕРСИИ)
     # ========================================================================
     def load_cloud_config(self) -> Dict[str, Any]:
         config_path = self.data_dir / "cloud_config.json"
@@ -293,10 +951,7 @@ class HighVolumeAutoPartsCatalog:
             json.dump(self.category_mapping, f, indent=2, ensure_ascii=False)
     
     def load_column_mapping_config(self) -> Dict[str, Dict[str, List[str]]]:
-        """Загрузка расширенной конфигурации маппинга колонок"""
         config_path = self.data_dir / "column_mapping.json"
-        
-        # Расширенный список вариантов названий колонок
         default_config = {
             'oe': {
                 'oe_number': [
@@ -458,7 +1113,6 @@ class HighVolumeAutoPartsCatalog:
             try:
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
-                # Объединение с дефолтными значениями
                 for file_type in default_config:
                     if file_type not in config:
                         config[file_type] = default_config[file_type]
@@ -476,13 +1130,11 @@ class HighVolumeAutoPartsCatalog:
             return default_config
     
     def save_column_mapping_config(self):
-        """Сохранение конфигурации маппинга колонок"""
         config_path = self.data_dir / "column_mapping.json"
         with open(config_path, 'w', encoding='utf-8') as f:
             json.dump(self.column_mapping_config, f, indent=2, ensure_ascii=False)
     
     def load_link_rules(self) -> Dict[str, Any]:
-        """Загрузка правил связывания данных"""
         link_rules_path = self.data_dir / "link_rules.json"
         default_rules = {
             "use_cross_references": True,
@@ -510,7 +1162,6 @@ class HighVolumeAutoPartsCatalog:
             return default_rules
     
     def save_link_rules(self):
-        """Сохранение правил связывания"""
         link_rules_path = self.data_dir / "link_rules.json"
         with open(link_rules_path, 'w', encoding='utf-8') as f:
             json.dump(self.link_rules, f, indent=2, ensure_ascii=False)
@@ -523,7 +1174,6 @@ class HighVolumeAutoPartsCatalog:
         """Создание и оптимизация структуры базы данных"""
         logger.info("🔧 Настройка базы данных...")
         
-        # Создание основных таблиц
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS oe (
                 oe_number_norm VARCHAR PRIMARY KEY,
@@ -594,22 +1244,16 @@ class HighVolumeAutoPartsCatalog:
         logger.info("⚙️ Создание индексов...")
         
         indexes = [
-            # Основные индексы
             "CREATE INDEX IF NOT EXISTS idx_oe_number_norm ON oe(oe_number_norm)",
             "CREATE INDEX IF NOT EXISTS idx_oe_category ON oe(category)",
             "CREATE INDEX IF NOT EXISTS idx_oe_name ON oe(name)",
-            
             "CREATE INDEX IF NOT EXISTS idx_parts_keys ON parts(artikul_norm, brand_norm)",
             "CREATE INDEX IF NOT EXISTS idx_parts_brand ON parts(brand_norm)",
             "CREATE INDEX IF NOT EXISTS idx_parts_artikul ON parts(artikul_norm)",
-            
             "CREATE INDEX IF NOT EXISTS idx_cross_oe ON cross_references(oe_number_norm)",
             "CREATE INDEX IF NOT EXISTS idx_cross_artikul ON cross_references(artikul_norm, brand_norm)",
-            
             "CREATE INDEX IF NOT EXISTS idx_prices_keys ON prices(artikul_norm, brand_norm)",
             "CREATE INDEX IF NOT EXISTS idx_prices_price ON prices(price)",
-            
-            # Составные индексы
             "CREATE INDEX IF NOT EXISTS idx_cross_oe_artikul ON cross_references(oe_number_norm, artikul_norm, brand_norm)",
             "CREATE INDEX IF NOT EXISTS idx_parts_brand_artikul ON parts(brand_norm, artikul_norm)"
         ]
@@ -635,11 +1279,9 @@ class HighVolumeAutoPartsCatalog:
         }
         
         try:
-            # Размер БД
             if self.db_path.exists():
                 checks['db_size_mb'] = round(self.db_path.stat().st_size / (1024 * 1024), 2)
             
-            # Проверка таблиц
             tables = self.conn.execute("""
                 SELECT table_name FROM information_schema.tables 
                 WHERE table_schema='main' AND table_type='BASE TABLE'
@@ -649,7 +1291,6 @@ class HighVolumeAutoPartsCatalog:
             expected_tables = {'oe', 'parts', 'cross_references', 'prices', 'metadata'}
             checks['tables_ok'] = expected_tables.issubset(existing_tables)
             
-            # Подсчет записей
             for table in expected_tables:
                 if table in existing_tables:
                     try:
@@ -658,7 +1299,6 @@ class HighVolumeAutoPartsCatalog:
                     except Exception:
                         checks['total_rows'][table] = -1
             
-            # Проверка сиротских записей
             orphan_cross = self.conn.execute("""
                 SELECT COUNT(*) FROM cross_references cr
                 WHERE NOT EXISTS (
@@ -682,7 +1322,6 @@ class HighVolumeAutoPartsCatalog:
                 'oe_orphans': orphan_oe
             }
             
-            # Проверка целостности
             try:
                 integrity = self.conn.execute("PRAGMA integrity_check").fetchone()
                 checks['corruption_detected'] = (integrity[0] != 'ok')
@@ -702,7 +1341,6 @@ class HighVolumeAutoPartsCatalog:
             self.conn.execute("VACUUM")
             logger.info("✅ VACUUM завершен")
             
-            # Анализ для оптимизатора запросов
             try:
                 self.conn.execute("ANALYZE")
                 logger.info("✅ ANALYZE завершен")
@@ -715,7 +1353,7 @@ class HighVolumeAutoPartsCatalog:
             return False
     
     # ========================================================================
-    # НОРМАЛИЗАЦИЯ И ОЧИСТКА
+    # НОРМАЛИЗАЦИЯ И ОЧИСТКА (СОХРАНЕНЫ ИЗ ПРЕДЫДУЩЕЙ ВЕРСИИ)
     # ========================================================================
     @staticmethod
     def normalize_key(series: pl.Series) -> pl.Series:
@@ -723,8 +1361,8 @@ class HighVolumeAutoPartsCatalog:
         return (series
                 .fill_null("")
                 .cast(pl.Utf8)
-                .str.replace_all(r"[''""]", "")  # Удаление кавычек
-                .str.replace_all(r"[^0-9A-Za-zА-Яа-яЁё`\-\s]", "")  # Только буквы, цифры, дефис, пробел
+                .str.replace_all(r"[''\"]", "")
+                .str.replace_all(r"[^0-9A-Za-zА-Яа-яЁё`\-\s]", "")
                 .str.replace_all(r"\s+", " ")
                 .str.strip_chars()
                 .str.to_lowercase())
@@ -744,16 +1382,13 @@ class HighVolumeAutoPartsCatalog:
         """Улучшенное определение категорий с поддержкой множественных правил"""
         name_lower = name_series.str.to_lowercase()
         
-        # Начинаем с None
         categorization_expr = pl.when(pl.lit(False)).then(pl.lit(None))
         
-        # Пользовательские правила — наивысший приоритет
         for key, category in sorted(self.category_mapping.items(), key=lambda x: len(x[0]), reverse=True):
             categorization_expr = categorization_expr.when(
                 name_lower.str.contains(key.lower(), literal=True)
             ).then(pl.lit(category))
         
-        # Расширенные стандартные правила
         categories_map = {
             'Фильтры': r'фильтр|filter|filtr|воздушный|масляный|салонный|топливный',
             'Тормозная система': r'тормоз|brake|колодк|диск тормозной|суппорт|барабан|цилиндр тормозной|шланг тормозной',
@@ -775,7 +1410,7 @@ class HighVolumeAutoPartsCatalog:
         return categorization_expr.otherwise(pl.lit('Разное')).alias('category')
     
     # ========================================================================
-    # УНИВЕРСАЛЬНАЯ КОНВЕРТАЦИЯ В ЧИСЛО (БЕЗ LOOK-AHEAD REGEX)
+    # БЕЗОПАСНАЯ КОНВЕРТАЦИЯ В ЧИСЛО
     # ========================================================================
     @staticmethod
     def safe_convert_to_float(value: Any) -> float:
@@ -813,11 +1448,9 @@ class HighVolumeAutoPartsCatalog:
             if not value:
                 return 0.0
             
-            # Обработка специальных случаев
             if value.lower() in ['нет', 'no', 'none', 'null', 'nan', 'inf', '-inf']:
                 return 0.0
             
-            # Обработка дробей вида "1/2"
             if '/' in value and value.count('/') == 1:
                 try:
                     num, den = value.split('/')
@@ -825,24 +1458,18 @@ class HighVolumeAutoPartsCatalog:
                 except (ValueError, ZeroDivisionError):
                     pass
             
-            # Очистка строки
             cleaned = re.sub(r'[^\d.,\-]', '', value)
             if not cleaned:
                 return 0.0
             
-            # Замена запятой на точку
             cleaned = cleaned.replace(',', '.')
-            
-            # Обработка множественных точек БЕЗ look-ahead
             parts = cleaned.split('.')
             if len(parts) > 2:
                 cleaned = parts[0] + '.' + ''.join(parts[1:])
             
-            # Удаление точки в начале, если это не десятичная дробь
             if cleaned.startswith('.') and len(cleaned) > 1:
                 cleaned = '0' + cleaned
             
-            # Удаление точки в конце
             if cleaned.endswith('.'):
                 cleaned = cleaned[:-1]
             
@@ -851,7 +1478,6 @@ class HighVolumeAutoPartsCatalog:
             except ValueError:
                 return 0.0
         
-        # Обработка numpy типов
         if hasattr(value, 'dtype') and hasattr(value, 'item'):
             try:
                 item = value.item()
@@ -872,64 +1498,45 @@ class HighVolumeAutoPartsCatalog:
             return 0.0
     
     # ========================================================================
-    # ОПРЕДЕЛЕНИЕ ТИПА ФАЙЛА (ДЛЯ UNIVERSAL)
+    # ОПРЕДЕЛЕНИЕ ТИПА ФАЙЛА
     # ========================================================================
     def _detect_file_type(self, columns: Set[str]) -> str:
-        """
-        Определение типа файла по набору колонок (для универсальных файлов)
-        """
-        # Преобразуем все в нижний регистр для поиска
+        """Определение типа файла по набору колонок"""
         cols_lower = {c.lower() for c in columns}
         
-        # Проверяем наличие ключевых колонок для каждого типа
-        # Приоритет: cross -> oe -> dimensions -> barcode -> images -> prices
-        
-        # 1. Кросс-ссылки: должны быть и OE, и артикул
         if 'oe' in cols_lower and ('artikul' in cols_lower or 'артикул' in cols_lower):
             return 'cross'
         
-        # 2. OE данные: есть OE, артикул и название/применимость
         if 'oe' in cols_lower and ('name' in cols_lower or 'наименование' in cols_lower or 'applicability' in cols_lower or 'применимость' in cols_lower):
             return 'oe'
         
-        # 3. Габариты: есть размеры
         dimension_cols = {'длина', 'длина (см)', 'length', 'ширина', 'ширина (см)', 'width', 
                          'высота', 'высота (см)', 'height', 'вес', 'вес (кг)', 'weight'}
         if len(cols_lower & dimension_cols) >= 2 and ('artikul' in cols_lower or 'артикул' in cols_lower):
             return 'dimensions'
         
-        # 4. Штрих-коды: есть barcode или EAN13
         barcode_cols = {'barcode', 'штрих-код', 'штрихкод', 'ean13', 'ean'}
         if len(cols_lower & barcode_cols) >= 1:
             return 'barcode'
         
-        # 5. Изображения: есть URL изображения
         image_cols = {'image_url', 'ссылка на изображение', 'изображение', 'image', 'img'}
         if len(cols_lower & image_cols) >= 1:
             return 'images'
         
-        # 6. Цены: есть цена
         price_cols = {'price', 'цена', 'cost'}
         if len(cols_lower & price_cols) >= 1:
             return 'prices'
         
-        # 7. Если есть артикул и бренд - пытаемся как OE
         if ('artikul' in cols_lower or 'артикул' in cols_lower) and ('brand' in cols_lower or 'бренд' in cols_lower):
             return 'oe'
         
         return 'unknown'
     
     # ========================================================================
-    # РАСШИРЕННАЯ ОБРАБОТКА ФАЙЛОВ
+    # ОБРАБОТКА ФАЙЛОВ (СОХРАНЕНА ИЗ ПРЕДЫДУЩЕЙ ВЕРСИИ)
     # ========================================================================
     def detect_columns_advanced(self, actual_columns: List[str], file_type: str) -> Dict[str, str]:
-        """
-        Расширенное определение колонок с использованием:
-        - Конфигурации column_mapping_config
-        - Нечеткого сопоставления (fuzzy matching)
-        - Анализа содержимого колонок
-        """
-        # Попытка найти похожий тип файла
+        """Расширенное определение колонок"""
         if file_type not in self.column_mapping_config:
             for known_type in self.column_mapping_config:
                 if known_type in file_type or file_type in known_type:
@@ -960,15 +1567,12 @@ class HighVolumeAutoPartsCatalog:
                     
                     score = 0
                     
-                    # Точное совпадение
                     if variant_lower == actual_l:
                         score = 100
-                    # Полное вхождение
                     elif variant_lower in actual_l:
                         score = 80 + len(variant_lower) / max(len(actual_l), 1) * 20
                     elif actual_l in variant_lower:
                         score = 60 + len(actual_l) / max(len(variant_lower), 1) * 20
-                    # Частичное совпадение слов
                     else:
                         variant_words = set(variant_lower.split())
                         actual_words = set(actual_l.split())
@@ -976,7 +1580,6 @@ class HighVolumeAutoPartsCatalog:
                         if common_words:
                             score = 40 + (len(common_words) / max(len(variant_words), len(actual_words), 1)) * 40
                     
-                    # Бонус за наличие в начале строки
                     if actual_l.startswith(variant_lower) or variant_lower.startswith(actual_l):
                         score += 10
                     
@@ -984,7 +1587,7 @@ class HighVolumeAutoPartsCatalog:
                         best_score = score
                         best_match = actual_orig
             
-            if best_match and best_score > 30:  # Порог для принятия маппинга
+            if best_match and best_score > 30:
                 mapping[best_match] = expected_field
                 used_actual.add(best_match)
                 logger.debug(f"Маппинг: {best_match} -> {expected_field} (score: {best_score:.0f})")
@@ -1002,14 +1605,12 @@ class HighVolumeAutoPartsCatalog:
                 logger.error(f"Файл не найден: {file_path}")
                 return pl.DataFrame()
             
-            # Автоматическое определение формата файла
             file_path_obj = Path(file_path)
             file_ext = file_path_obj.suffix.lower()
             file_size_mb = file_path_obj.stat().st_size / (1024 * 1024)
             
             logger.info(f"Размер файла: {file_size_mb:.2f} МБ")
             
-            # Выбор стратегии чтения в зависимости от расширения
             if file_ext == '.csv':
                 try:
                     df = pl.read_csv(
@@ -1024,11 +1625,9 @@ class HighVolumeAutoPartsCatalog:
             
             elif file_ext in ['.xlsx', '.xls']:
                 try:
-                    # Пробуем calamine engine для скорости
                     df = pl.read_excel(file_path, engine='calamine')
                 except Exception:
                     try:
-                        # Fallback на стандартный движок
                         df = pl.read_excel(file_path)
                     except Exception as e:
                         logger.error(f"Ошибка чтения Excel: {e}")
@@ -1063,7 +1662,6 @@ class HighVolumeAutoPartsCatalog:
             logger.exception(f"Ошибка чтения файла {file_path}: {e}")
             return pl.DataFrame()
         
-        # Определение колонок через расширенный маппинг
         column_mapping = self.detect_columns_advanced(df.columns, file_type)
         
         if not column_mapping:
@@ -1072,7 +1670,6 @@ class HighVolumeAutoPartsCatalog:
         
         logger.info(f"Маппинг колонок для {file_type}: {column_mapping}")
         
-        # Переименование колонок
         try:
             rename_dict = {old: new for old, new in column_mapping.items() 
                           if old in df.columns and new not in df.columns}
@@ -1080,7 +1677,6 @@ class HighVolumeAutoPartsCatalog:
                 df = df.rename(rename_dict)
         except Exception as e:
             logger.warning(f"Ошибка при rename: {e}")
-            # Поочередное переименование
             for old_name, new_name in column_mapping.items():
                 try:
                     if old_name in df.columns and new_name not in df.columns:
@@ -1088,7 +1684,6 @@ class HighVolumeAutoPartsCatalog:
                 except Exception as e2:
                     logger.warning(f"Не удалось переименовать {old_name} -> {new_name}: {e2}")
         
-        # Удаление дубликатов колонок
         if len(df.columns) != len(set(df.columns)):
             logger.warning("Обнаружены дубликаты колонок")
             seen = set()
@@ -1101,7 +1696,6 @@ class HighVolumeAutoPartsCatalog:
                     logger.warning(f"Удаляем дубликат колонки: {col}")
             df = df.select(cols_to_keep)
         
-        # Очистка текстовых колонок
         for col in ['artikul', 'brand', 'oe_number', 'name', 'applicability']:
             if col in df.columns:
                 try:
@@ -1109,15 +1703,12 @@ class HighVolumeAutoPartsCatalog:
                 except Exception as e:
                     logger.warning(f"Ошибка очистки колонки {col}: {e}")
         
-        # ИСПРАВЛЕНИЕ: Конвертация числовых колонок без look-ahead regex
         numeric_cols = ['length', 'width', 'height', 'weight', 'price']
         for col in numeric_cols:
             if col in df.columns:
                 try:
-                    # Проверяем, является ли колонка уже числовой
                     current_dtype = df[col].dtype
                     if current_dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32, pl.UInt32, pl.UInt64]:
-                        # Уже числовая колонка - просто приводим к Float64
                         df = df.with_columns(
                             pl.col(col)
                             .cast(pl.Float64, strict=False)
@@ -1127,7 +1718,6 @@ class HighVolumeAutoPartsCatalog:
                         )
                         logger.info(f"✅ Колонка '{col}' уже числовая ({current_dtype}), приведена к Float64")
                     else:
-                        # Строковая колонка - конвертируем
                         df = df.with_columns(
                             pl.col(col)
                             .cast(pl.Utf8)
@@ -1141,19 +1731,16 @@ class HighVolumeAutoPartsCatalog:
                         logger.info(f"✅ Колонка '{col}' сконвертирована из строки в Float64")
                 except Exception as e:
                     logger.warning(f"Не удалось преобразовать {col}: {e}")
-                    # Создаем колонку с нулями если не существует
                     if col not in df.columns:
                         try:
                             df = df.with_columns(pl.lit(0.0).cast(pl.Float64).alias(col))
                         except Exception:
                             pass
         
-        # Удаление дубликатов по ключевым полям
         key_cols = [col for col in ['oe_number', 'artikul', 'brand'] if col in df.columns]
         if key_cols:
             df = df.unique(subset=key_cols, keep='first')
         
-        # Нормализация ключей
         for col in ['artikul', 'brand', 'oe_number']:
             if col in df.columns:
                 try:
@@ -1171,33 +1758,28 @@ class HighVolumeAutoPartsCatalog:
         return df
     
     def _align_dataframes_for_concat(self, dfs: List[pl.DataFrame]) -> List[pl.DataFrame]:
-        """
-        Выравнивание списка DataFrames для объединения с приведением типов
-        """
+        """Выравнивание списка DataFrames для объединения с приведением типов"""
         if not dfs:
             return []
         
         if len(dfs) == 1:
             return dfs
         
-        # Собираем все колонки
         all_columns = set()
         for d in dfs:
             all_columns.update(d.columns)
         
-        # Определяем типы для каждой колонки
         column_types = {}
         for d in dfs:
             for col in all_columns:
                 if col in d.columns and col not in column_types:
                     column_types[col] = d[col].dtype
                 elif col not in d.columns and col not in column_types:
-                    # Определяем тип по умолчанию в зависимости от имени колонки
                     if col in ['length', 'width', 'height', 'weight', 'price']:
                         column_types[col] = pl.Float64
                     elif col in ['multiplicity']:
                         column_types[col] = pl.Int64
-                    elif col in ['oe_number', 'oe_number_norm', 'artikul', 'brand', 'artikul_norm', 'brand_norm', 'name', 'applicability', 'dimensions_str', 'image_url', 'barcode', 'description', 'category', 'Марка', 'Марка авто', 'Страна']:
+                    elif col in ['oe_number', 'oe_number_norm', 'artikul', 'brand', 'artikul_norm', 'brand_norm', 'name', 'applicability', 'dimensions_str', 'image_url', 'barcode', 'description', 'category']:
                         column_types[col] = pl.Utf8
                     else:
                         column_types[col] = pl.Utf8
@@ -1206,7 +1788,6 @@ class HighVolumeAutoPartsCatalog:
         for d in dfs:
             d_aligned = d
             
-            # Добавляем отсутствующие колонки с правильными типами
             for mc in all_columns:
                 if mc not in d.columns:
                     target_type = column_types.get(mc, pl.Utf8)
@@ -1217,7 +1798,6 @@ class HighVolumeAutoPartsCatalog:
                     else:
                         d_aligned = d_aligned.with_columns(pl.lit(None).cast(pl.Utf8).alias(mc))
             
-            # Приводим существующие колонки к единому типу
             for col in all_columns:
                 if col in d_aligned.columns:
                     target_type = column_types.get(col, pl.Utf8)
@@ -1240,7 +1820,6 @@ class HighVolumeAutoPartsCatalog:
                     except Exception as e:
                         logger.warning(f"Не удалось привести колонку {col} к типу {target_type}: {e}")
             
-            # Выбираем колонки в отсортированном порядке
             d_aligned = d_aligned.select(sorted(all_columns))
             aligned_dfs.append(d_aligned)
         
@@ -1252,11 +1831,9 @@ class HighVolumeAutoPartsCatalog:
         temp_dir = self.data_dir / "temp_uploads"
         temp_dir.mkdir(exist_ok=True)
         
-        # Разделяем файлы на universal и остальные типы
         universal_files = uploaded_files_dict.pop('universal', [])
         other_files = uploaded_files_dict
         
-        # Сначала обрабатываем остальные типы файлов
         for file_type, files in other_files.items():
             if not files:
                 continue
@@ -1293,11 +1870,9 @@ class HighVolumeAutoPartsCatalog:
                         logger.info(f"DataFrame {i} типы: {d.schema}")
                     st.error(f"❌ Ошибка объединения файлов типа '{file_type}': {str(e)}")
         
-        # Обработка universal-файлов с определением типа по содержимому
         if universal_files:
             logger.info(f"🔍 Обработка {len(universal_files)} универсальных файлов...")
             
-            # Группируем файлы по фактическому типу данных
             universal_groups = {
                 'oe': [],
                 'cross': [],
@@ -1312,21 +1887,18 @@ class HighVolumeAutoPartsCatalog:
                 
                 with temp_upload_file(uploaded_file) as temp_path:
                     try:
-                        # Читаем только заголовки для определения типа
                         temp_df = self.read_and_prepare_file(str(temp_path), 'universal')
                         
                         if temp_df.is_empty():
                             logger.warning(f"⚠️ Файл '{uploaded_file.name}' пуст, пропускаем")
                             continue
                         
-                        # Определяем тип по колонкам
                         cols = set(c.lower() for c in temp_df.columns)
                         detected_type = self._detect_file_type(cols)
                         
                         logger.info(f"📌 Файл '{uploaded_file.name}' определен как тип: {detected_type}")
                         
                         if detected_type != 'unknown':
-                            # Перечитываем файл с правильным типом
                             with temp_upload_file(uploaded_file) as temp_path2:
                                 df = self.read_and_prepare_file(str(temp_path2), detected_type)
                                 if not df.is_empty():
@@ -1335,7 +1907,6 @@ class HighVolumeAutoPartsCatalog:
                                 else:
                                     logger.warning(f"⚠️ Файл '{uploaded_file.name}' не удалось прочитать с типом {detected_type}")
                         else:
-                            # Если тип не определен, пробуем как OE
                             with temp_upload_file(uploaded_file) as temp_path2:
                                 df = self.read_and_prepare_file(str(temp_path2), 'oe')
                                 if not df.is_empty():
@@ -1348,7 +1919,6 @@ class HighVolumeAutoPartsCatalog:
                         logger.exception(f"❌ Ошибка анализа файла '{uploaded_file.name}': {e}")
                         st.error(f"❌ Ошибка обработки файла '{uploaded_file.name}': {str(e)}")
             
-            # Обрабатываем каждую группу отдельно
             for file_type, dfs in universal_groups.items():
                 if not dfs:
                     continue
@@ -1366,7 +1936,7 @@ class HighVolumeAutoPartsCatalog:
         return results
     
     # ========================================================================
-    # ЗАГРУЗКА И ОБНОВЛЕНИЕ В БАЗЕ (УЛУЧШЕННЫЙ UPSERT)
+    # ЗАГРУЗКА И ОБНОВЛЕНИЕ В БАЗЕ
     # ========================================================================
     def upsert_data_batched(self, table_name: str, df: pl.DataFrame, batch_size: int = BATCH_SIZE):
         """Пакетный UPSERT данных с проверкой целостности"""
@@ -1387,8 +1957,6 @@ class HighVolumeAutoPartsCatalog:
             
             try:
                 self.conn.register(temp_view_name, batch.to_arrow())
-                
-                # Атомарный INSERT OR REPLACE
                 insert_sql = f"INSERT OR REPLACE INTO {table_name} SELECT * FROM {temp_view_name}"
                 self.conn.execute(insert_sql)
                 
@@ -1400,7 +1968,6 @@ class HighVolumeAutoPartsCatalog:
                 
             except Exception as e:
                 logger.error(f"Ошибка при UPSERT в {table_name} (строки {start_idx}-{end_idx}): {e}")
-                # Попытка по одной строке для выявления проблемных записей
                 for i in range(len(batch)):
                     single_row = batch.slice(i, 1)
                     try:
@@ -1429,7 +1996,6 @@ class HighVolumeAutoPartsCatalog:
         
         st.info("🔄 Начало загрузки и обновления данных в базе...")
         
-        # Определение шагов обработки
         steps = []
         if 'oe' in dataframes:
             steps.append(('oe', self._process_oe_data))
@@ -1459,12 +2025,10 @@ class HighVolumeAutoPartsCatalog:
         progress_bar.progress(1.0)
         status_text.text("✅ Загрузка данных завершена!")
         
-        # Сохранение статистики в session_state
         st.session_state.uploaded_files = {
             k: len(v) for k, v in dataframes.items()
         }
         
-        # Оптимизация базы после загрузки
         self.vacuum_database()
         
         time.sleep(1)
@@ -1478,7 +2042,6 @@ class HighVolumeAutoPartsCatalog:
         
         df = oe_df.filter(pl.col('oe_number_norm') != "")
         
-        # Обеспечение наличия всех колонок
         for col in ['length', 'width', 'height', 'weight']:
             if col not in df.columns:
                 df = df.with_columns(pl.lit(0.0).cast(pl.Float64).alias(col))
@@ -1486,14 +2049,12 @@ class HighVolumeAutoPartsCatalog:
         if 'dimensions_str' not in df.columns:
             df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias('dimensions_str'))
         
-        # Формирование DataFrame для OE
         oe_cols = ['oe_number_norm', 'oe_number', 'name', 'applicability',
                    'length', 'width', 'height', 'weight', 'dimensions_str']
         
         available_cols = [c for c in oe_cols if c in df.columns]
         oe_clean = df.select(available_cols).unique(subset=['oe_number_norm'], keep='first')
         
-        # Определение категорий
         if 'name' in oe_clean.columns:
             oe_clean = oe_clean.with_columns(
                 self.determine_category_vectorized(pl.col('name')).alias('category')
@@ -1506,7 +2067,6 @@ class HighVolumeAutoPartsCatalog:
         
         self.upsert_data_batched('oe', oe_clean)
         
-        # Создание кросс-ссылок из OE данных
         if 'artikul_norm' in df.columns and 'brand_norm' in df.columns:
             cross_from_oe = df.filter(pl.col('artikul_norm') != "").select([
                 'oe_number_norm', 'artikul_norm', 'brand_norm'
@@ -1553,13 +2113,11 @@ class HighVolumeAutoPartsCatalog:
                     pl.lit(self.price_rules.get('currency', 'RUB')).alias('currency')
                 )
             
-            # Применение правил цен
             prices_df = prices_df.filter(
                 (pl.col('price') >= self.price_rules.get('min_price', 0.0)) &
                 (pl.col('price') <= self.price_rules.get('max_price', 99999.0))
             )
             
-            # Округление цен если нужно
             if self.price_rules.get('round_prices', True):
                 precision = self.price_rules.get('price_precision', 2)
                 prices_df = prices_df.with_columns(
@@ -1570,7 +2128,6 @@ class HighVolumeAutoPartsCatalog:
     
     def _process_parts_data(self, dataframes: Dict[str, pl.DataFrame]):
         """Сборка и загрузка данных по артикулам"""
-        # Сбор всех артикулов
         parts_to_concat = []
         file_priority = ['oe', 'dimensions', 'barcode', 'images']
         
@@ -1579,7 +2136,6 @@ class HighVolumeAutoPartsCatalog:
                 df = dataframes[ftype]
                 if 'artikul_norm' in df.columns and 'brand_norm' in df.columns:
                     cols = ['artikul_norm', 'brand_norm']
-                    # Добавляем артикул и бренд если есть
                     for c in ['artikul', 'brand']:
                         if c in df.columns:
                             cols.append(c)
@@ -1588,7 +2144,6 @@ class HighVolumeAutoPartsCatalog:
         if not parts_to_concat:
             return
         
-        # Выравнивание колонок перед объединением
         aligned_parts = self._align_dataframes_for_concat(parts_to_concat)
         if not aligned_parts:
             return
@@ -1600,7 +2155,6 @@ class HighVolumeAutoPartsCatalog:
         if parts_df.is_empty():
             return
         
-        # Добавление дополнительных данных из разных типов файлов
         for ftype in file_priority:
             if ftype not in dataframes or dataframes[ftype].is_empty():
                 continue
@@ -1609,7 +2163,6 @@ class HighVolumeAutoPartsCatalog:
             if 'artikul_norm' not in df.columns:
                 continue
             
-            # Определение колонок для добавления
             if ftype in ['oe', 'dimensions']:
                 join_cols = ['length', 'width', 'height', 'weight', 'dimensions_str']
             else:
@@ -1632,7 +2185,6 @@ class HighVolumeAutoPartsCatalog:
             except Exception as e:
                 logger.warning(f"Ошибка JOIN для {ftype}: {e}")
         
-        # Заполнение пропущенных значений
         if 'multiplicity' not in parts_df.columns:
             parts_df = parts_df.with_columns(pl.lit(1).cast(pl.Int32).alias('multiplicity'))
         else:
@@ -1647,13 +2199,9 @@ class HighVolumeAutoPartsCatalog:
         if 'dimensions_str' not in parts_df.columns:
             parts_df = parts_df.with_columns(pl.lit(None).cast(pl.Utf8).alias('dimensions_str'))
         
-        # Формирование dimensions_str из отдельных размеров
         parts_df = self._format_dimensions_string(parts_df)
-        
-        # Создание описания
         parts_df = self._create_description(parts_df)
         
-        # Формирование финального набора колонок
         final_columns = [
             'artikul_norm', 'brand_norm', 'artikul', 'brand', 'multiplicity', 'barcode',
             'length', 'width', 'height', 'weight', 'image_url', 'dimensions_str', 'description'
@@ -1721,7 +2269,7 @@ class HighVolumeAutoPartsCatalog:
         return df.drop(['_art', '_brd', '_mult'])
     
     # ========================================================================
-    # ЭКСПОРТ (ИСПРАВЛЕННЫЙ - УПРОЩЕННЫЙ CTE)
+    # ПОСТРОЕНИЕ ЗАПРОСА ДЛЯ ЭКСПОРТА
     # ========================================================================
     def _get_brand_markups_sql(self) -> str:
         """Получение SQL для наценок по брендам"""
@@ -1737,7 +2285,7 @@ class HighVolumeAutoPartsCatalog:
     
     def build_export_query(self, selected_columns=None, include_prices=True, 
                           apply_markup=True, apply_exclusions=True, use_link_rules=True):
-        """Построение запроса для экспорта с учетом всех настроек (ИСПРАВЛЕННАЯ ВЕРСИЯ)"""
+        """Построение запроса для экспорта с учетом всех настроек"""
         description_text = (
             "Состояние товара: новый (в упаковке). Высококачественные автозапчасти и автотовары — "
             "надежное решение для вашего автомобиля. Обеспечьте безопасность, долговечность и "
@@ -1745,7 +2293,6 @@ class HighVolumeAutoPartsCatalog:
             "оригинальных и совместимых автозапчастей."
         )
         
-        # Настройка связей
         if use_link_rules and self.link_rules.get('use_cross_references', True):
             max_depth = self.link_rules.get('max_link_depth', 2)
             link_by_oe_only = self.link_rules.get('link_by_oe_only', False)
@@ -1755,7 +2302,6 @@ class HighVolumeAutoPartsCatalog:
         
         brand_markups_sql = self._get_brand_markups_sql()
         
-        # Формирование списка колонок
         select_parts = []
         
         price_requested = include_prices and (not selected_columns or 
@@ -1772,23 +2318,43 @@ class HighVolumeAutoPartsCatalog:
                 select_parts.append('pr.price AS "Цена"')
             select_parts.append("COALESCE(pr.currency, 'RUB') AS \"Валюта\"")
         
-        # Основные колонки
         columns_map = {
-            "Артикул бренда": 'r.artikul AS "Артикул бренда"',
+            "Артикул": 'r.artikul AS "Артикул"',
+            "Артикул (SKU)": 'r.artikul AS "Артикул (SKU)"',
+            "Артикул производителя": 'r.artikul AS "Артикул производителя"',
+            "Артикул товара (SKU)": 'r.artikul AS "Артикул товара (SKU)"',
             "Бренд": 'r.brand AS "Бренд"',
-            "Наименование": 'COALESCE(r.representative_name, r.analog_representative_name) AS "Наименование"',
+            "Производитель": 'r.brand AS "Производитель"',
+            "Название товара": 'COALESCE(r.representative_name, r.analog_representative_name) AS "Название товара"',
+            "Название": 'COALESCE(r.representative_name, r.analog_representative_name) AS "Название"',
             "Применимость": 'COALESCE(r.representative_applicability, r.analog_representative_applicability) AS "Применимость"',
+            "Описание товара": 'r.description AS "Описание товара"',
             "Описание": 'r.description AS "Описание"',
-            "Категория товара": 'COALESCE(r.representative_category, r.analog_representative_category) AS "Категория товара"',
+            "Категория": 'COALESCE(r.representative_category, r.analog_representative_category) AS "Категория"',
+            "Категория на Маркете": 'COALESCE(r.representative_category, r.analog_representative_category) AS "Категория на Маркете"',
+            "Категория Yandex": 'COALESCE(r.representative_category, r.analog_representative_category) AS "Категория Yandex"',
+            "Категория Ozon": 'COALESCE(r.representative_category, r.analog_representative_category) AS "Категория Ozon"',
             "Кратность": 'r.multiplicity AS "Кратность"',
-            "Длинна": 'COALESCE(NULLIF(ROUND(CAST(r.length AS DOUBLE), 2), 0), NULLIF(ROUND(CAST(r.analog_length AS DOUBLE), 2), 0), 0.0) AS "Длинна"',
+            "Мин. партия": 'r.multiplicity AS "Мин. партия"',
+            "Длина, см": 'COALESCE(NULLIF(ROUND(CAST(r.length AS DOUBLE), 2), 0), NULLIF(ROUND(CAST(r.analog_length AS DOUBLE), 2), 0), 0.0) AS "Длина, см"',
+            "Длина": 'COALESCE(NULLIF(ROUND(CAST(r.length AS DOUBLE), 2), 0), NULLIF(ROUND(CAST(r.analog_length AS DOUBLE), 2), 0), 0.0) AS "Длина"',
+            "Ширина, см": 'COALESCE(NULLIF(ROUND(CAST(r.width AS DOUBLE), 2), 0), NULLIF(ROUND(CAST(r.analog_width AS DOUBLE), 2), 0), 0.0) AS "Ширина, см"',
             "Ширина": 'COALESCE(NULLIF(ROUND(CAST(r.width AS DOUBLE), 2), 0), NULLIF(ROUND(CAST(r.analog_width AS DOUBLE), 2), 0), 0.0) AS "Ширина"',
+            "Высота, см": 'COALESCE(NULLIF(ROUND(CAST(r.height AS DOUBLE), 2), 0), NULLIF(ROUND(CAST(r.analog_height AS DOUBLE), 2), 0), 0.0) AS "Высота, см"',
             "Высота": 'COALESCE(NULLIF(ROUND(CAST(r.height AS DOUBLE), 2), 0), NULLIF(ROUND(CAST(r.analog_height AS DOUBLE), 2), 0), 0.0) AS "Высота"',
+            "Вес, кг": 'COALESCE(NULLIF(ROUND(CAST(r.weight AS DOUBLE), 2), 0), NULLIF(ROUND(CAST(r.analog_weight AS DOUBLE), 2), 0), 0.0) AS "Вес, кг"',
             "Вес": 'COALESCE(NULLIF(ROUND(CAST(r.weight AS DOUBLE), 2), 0), NULLIF(ROUND(CAST(r.analog_weight AS DOUBLE), 2), 0), 0.0) AS "Вес"',
-            "Длинна/Ширина/Высота": 'COALESCE(NULLIF(r.dimensions_str, \'\'), r.analog_dimensions_str) AS "Длинна/Ширина/Высота"',
             "OE номер": 'r.oe_list AS "OE номер"',
-            "аналоги": 'r.analog_list AS "аналоги"',
-            "Ссылка на изображение": 'r.image_url AS "Ссылка на изображение"'
+            "Кроссы": 'r.analog_list AS "Кроссы"',
+            "Аналоги": 'r.analog_list AS "Аналоги"',
+            "Ссылка на изображение": 'r.image_url AS "Ссылка на изображение"',
+            "Дополнительные изображения": 'r.image_url AS "Дополнительные изображения"',
+            "Штрихкод": 'r.barcode AS "Штрихкод"',
+            "EAN": 'r.barcode AS "EAN"',
+            "Штрих-код": 'r.barcode AS "Штрих-код"',
+            "Наличие": '100 AS "Наличие"',
+            "Состояние": 'pl.lit("Новый") AS "Состояние"',
+            "Гарантийный срок": 'pl.lit("12 месяцев") AS "Гарантийный срок"',
         }
         
         for name, expr in columns_map.items():
@@ -1796,11 +2362,10 @@ class HighVolumeAutoPartsCatalog:
                 select_parts.append(expr.strip())
         
         if not select_parts:
-            select_parts = ['r.artikul AS "Артикул бренда"', 'r.brand AS "Бренд"']
+            select_parts = ['r.artikul AS "Артикул"', 'r.brand AS "Бренд"']
         
         select_clause = ",\n".join(select_parts)
         
-        # Добавление исключений
         exclusion_where = ""
         if apply_exclusions and self.exclusion_rules:
             exclusion_conditions = []
@@ -1813,7 +2378,6 @@ class HighVolumeAutoPartsCatalog:
             if exclusion_conditions:
                 exclusion_where = "AND " + " AND ".join(exclusion_conditions)
         
-        # ИСПРАВЛЕННЫЙ CTE - oe_number_norm явно указан в Level1Analogs
         query = f"""
         WITH DescriptionTemplate AS (
             SELECT CHR(10) || CHR(10) || $${description_text}$$ AS text
@@ -1914,7 +2478,7 @@ class HighVolumeAutoPartsCatalog:
                 ROUND(CAST(p.width AS DOUBLE), 2) AS width,
                 ROUND(CAST(p.height AS DOUBLE), 2) AS height,
                 ROUND(CAST(p.weight AS DOUBLE), 2) AS weight,
-                p.dimensions_str, p.image_url,
+                p.dimensions_str, p.image_url, p.barcode,
                 pd.representative_name, pd.representative_applicability, pd.representative_category, pd.oe_list,
                 aa.analog_list,
                 p_analog.analog_length, p_analog.analog_width, p_analog.analog_height, p_analog.analog_weight,
@@ -1939,238 +2503,55 @@ class HighVolumeAutoPartsCatalog:
         
         return "\n".join([line.rstrip() for line in query.strip().splitlines()])
     
+    # ========================================================================
+    # МЕТОДЫ ЭКСПОРТА (ОБНОВЛЕННЫЕ)
+    # ========================================================================
     @timing_decorator
-    def export_to_csv_optimized(self, output_path: str, selected_columns: Optional[List[str]] = None,
-                               include_prices: bool = True, apply_markup: bool = True,
-                               apply_exclusions: bool = True) -> bool:
-        """Экспорт в CSV с чанковой обработкой для больших объемов"""
-        total = self.conn.execute(
-            "SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts)").fetchone()[0]
-        
-        if total == 0:
-            st.warning("Нет данных для экспорта")
-            return False
-        
-        st.info(f"📤 Экспорт {total:,} записей в CSV...")
-        
-        try:
-            query = self.build_export_query(
-                selected_columns, include_prices, apply_markup, apply_exclusions
-            )
-            
-            logger.info(f"Executing export query (первые 500 символов): {query[:500]}...")
-            
-            # Чанковый экспорт для больших объемов
-            if total > 500_000:
-                return self._export_csv_chunked(output_path, query, total)
-            
-            df = self.conn.execute(query).pl()
-            
-            # Постобработка
-            pdf = self._postprocess_export(df.to_pandas())
-            
-            # Запись с BOM для Excel
-            output_dir = Path(output_path).parent
-            output_dir.mkdir(parents=True, exist_ok=True)
-            
-            buf = io.StringIO()
-            pdf.to_csv(buf, sep=';', index=False)
-            
-            with open(output_path, "wb") as f:
-                f.write(b'\xef\xbb\xbf')
-                f.write(buf.getvalue().encode('utf-8'))
-            
-            size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            st.success(f"✅ Данные экспортированы: {Path(output_path).name} ({size_mb:.1f} МБ)")
-            return True
-            
-        except Exception as e:
-            logger.exception("Ошибка экспорта CSV")
-            st.error(f"❌ Ошибка при экспорте в CSV: {str(e)}")
-            return False
-    
-    def _export_csv_chunked(self, output_path: str, query: str, total: int, chunk_size: int = 100_000) -> bool:
-        """Чанковый экспорт в CSV"""
-        try:
-            chunks = (total // chunk_size) + 1
-            progress_bar = st.progress(0)
-            
-            with open(output_path, "wb") as f:
-                f.write(b'\xef\xbb\xbf')
-                
-                for i in range(chunks):
-                    offset = i * chunk_size
-                    chunk_query = f"{query} LIMIT {chunk_size} OFFSET {offset}"
-                    
-                    df = self.conn.execute(chunk_query).pl()
-                    pdf = self._postprocess_export(df.to_pandas())
-                    
-                    buf = io.StringIO()
-                    if i == 0:
-                        pdf.to_csv(buf, sep=';', index=False)
-                    else:
-                        pdf.to_csv(buf, sep=';', index=False, header=False)
-                    
-                    f.write(buf.getvalue().encode('utf-8'))
-                    
-                    progress = min((i + 1) / chunks, 1.0)
-                    progress_bar.progress(progress, text=f"Экспорт чанка {i + 1}/{chunks}...")
-            
-            progress_bar.empty()
-            st.success(f"✅ Экспортировано {total:,} записей")
-            return True
-            
-        except Exception as e:
-            logger.exception("Ошибка чанкового экспорта")
-            raise
-    
-    def _postprocess_export(self, pdf: pd.DataFrame) -> pd.DataFrame:
-        """Постобработка экспортированных данных"""
-        # Форматирование числовых колонок
-        dimension_cols = ["Длинна", "Ширина", "Высота", "Вес"]
-        for col in dimension_cols:
-            if col in pdf.columns:
-                try:
-                    pdf[col] = pd.to_numeric(pdf[col], errors='coerce').fillna(0).round(2)
-                except Exception:
-                    pdf[col] = 0.0
-        
-        # Очистка строк
-        if "Длинна/Ширина/Высота" in pdf.columns:
-            pdf["Длинна/Ширина/Высота"] = pdf["Длинна/Ширина/Высота"].astype(str).replace(
-                {'nan': '', 'None': '', 'null': ''}
-            )
-        
-        return pdf
-    
-    def export_to_excel_optimized(self, output_path: str, selected_columns: Optional[List[str]] = None,
-                                 include_prices: bool = True, apply_markup: bool = True,
-                                 apply_exclusions: bool = True) -> bool:
-        """Экспорт в Excel с поддержкой множества листов"""
-        total = self.conn.execute(
-            "SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts)").fetchone()[0]
-        
-        if total == 0:
-            st.warning("Нет данных для экспорта")
-            return False
-        
-        st.info(f"📤 Экспорт {total:,} записей в Excel...")
-        
-        query = self.build_export_query(
-            selected_columns, include_prices, apply_markup, apply_exclusions
+    def export_data(
+        self,
+        output_path: str,
+        selected_columns: Optional[List[str]] = None,
+        include_prices: bool = True,
+        apply_markup: bool = True,
+        apply_exclusions: bool = True,
+        format_type: str = 'csv',
+        market_format: Optional[str] = None,
+        template_name: Optional[str] = None,
+        template_description: Optional[str] = None,
+        csv_separator: str = ';',
+        decimal_separator: str = '.',
+        encoding: str = 'windows-1251',
+        add_apostrophe: bool = True,
+        use_crlf: bool = True,
+        remove_semicolon: bool = False,
+        split_size: int = 500000,
+        zip_archive: bool = False
+    ) -> bool:
+        """
+        Экспорт данных с поддержкой всех настроек
+        """
+        return self.export_handler.export_data(
+            output_path=output_path,
+            selected_columns=selected_columns,
+            include_prices=include_prices,
+            apply_markup=apply_markup,
+            apply_exclusions=apply_exclusions,
+            format_type=format_type,
+            market_format=market_format,
+            template_name=template_name,
+            template_description=template_description,
+            csv_separator=csv_separator,
+            decimal_separator=decimal_separator,
+            encoding=encoding,
+            add_apostrophe=add_apostrophe,
+            use_crlf=use_crlf,
+            remove_semicolon=remove_semicolon,
+            split_size=split_size,
+            zip_archive=zip_archive
         )
-        
-        try:
-            df = self.conn.execute(query).pl().to_pandas()
-            pdf = self._postprocess_export(df)
-            
-            # Создание Excel с несколькими листами если нужно
-            if len(pdf) <= EXCEL_ROW_LIMIT:
-                with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-                    pdf.to_excel(writer, index=False, sheet_name='Данные')
-            else:
-                sheets = (len(pdf) // EXCEL_ROW_LIMIT) + 1
-                with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-                    for i in range(sheets):
-                        start_idx = i * EXCEL_ROW_LIMIT
-                        end_idx = min((i + 1) * EXCEL_ROW_LIMIT, len(pdf))
-                        pdf.iloc[start_idx:end_idx].to_excel(
-                            writer, index=False, sheet_name=f"Данные_{i + 1}"
-                        )
-            
-            size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            st.success(f"✅ Экспортировано в Excel ({size_mb:.1f} МБ)")
-            return True
-            
-        except Exception as e:
-            logger.exception("Ошибка экспорта Excel")
-            st.error(f"❌ Ошибка при экспорте в Excel: {str(e)}")
-            return False
-    
-    def export_to_parquet(self, output_path: str, selected_columns: Optional[List[str]] = None,
-                         include_prices: bool = True, apply_markup: bool = True,
-                         apply_exclusions: bool = True) -> bool:
-        """Экспорт в Parquet формат"""
-        try:
-            query = self.build_export_query(
-                selected_columns, include_prices, apply_markup, apply_exclusions
-            )
-            df = self.conn.execute(query).pl()
-            df.write_parquet(output_path)
-            
-            size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            st.success(f"✅ Экспортировано в Parquet ({size_mb:.1f} МБ)")
-            return True
-            
-        except Exception as e:
-            logger.exception("Ошибка экспорта Parquet")
-            st.error(f"❌ Ошибка при экспорте в Parquet: {str(e)}")
-            return False
     
     # ========================================================================
-    # УПРАВЛЕНИЕ ДАННЫМИ
-    # ========================================================================
-    def delete_by_brand(self, brand_norm: str) -> int:
-        """Удаление записей по бренду с каскадным удалением связей"""
-        try:
-            # Получение количества до удаления
-            count_parts = self.conn.execute(
-                "SELECT COUNT(*) FROM parts WHERE brand_norm = ?", [brand_norm]).fetchone()[0]
-            
-            if count_parts == 0:
-                logger.info(f"Нет записей для бренда: {brand_norm}")
-                return 0
-            
-            # Каскадное удаление
-            self.conn.execute("""
-                DELETE FROM prices WHERE (artikul_norm, brand_norm) IN (
-                    SELECT artikul_norm, brand_norm FROM parts WHERE brand_norm = ?
-                )
-            """, [brand_norm])
-            
-            self.conn.execute("""
-                DELETE FROM cross_references WHERE (artikul_norm, brand_norm) IN (
-                    SELECT artikul_norm, brand_norm FROM parts WHERE brand_norm = ?
-                )
-            """, [brand_norm])
-            
-            self.conn.execute("DELETE FROM parts WHERE brand_norm = ?", [brand_norm])
-            
-            # Оптимизация после удаления
-            self.vacuum_database()
-            
-            logger.info(f"Удалено {count_parts} записей бренда: {brand_norm}")
-            return count_parts
-            
-        except Exception as e:
-            logger.error(f"Ошибка удаления бренда {brand_norm}: {e}")
-            raise
-    
-    def delete_by_artikul(self, artikul_norm: str) -> int:
-        """Удаление записей по артикулу"""
-        try:
-            count_parts = self.conn.execute(
-                "SELECT COUNT(*) FROM parts WHERE artikul_norm = ?", [artikul_norm]).fetchone()[0]
-            
-            if count_parts == 0:
-                logger.info(f"Нет записей для артикула: {artikul_norm}")
-                return 0
-            
-            # Каскадное удаление
-            self.conn.execute("DELETE FROM prices WHERE artikul_norm = ?", [artikul_norm])
-            self.conn.execute("DELETE FROM cross_references WHERE artikul_norm = ?", [artikul_norm])
-            self.conn.execute("DELETE FROM parts WHERE artikul_norm = ?", [artikul_norm])
-            
-            self.vacuum_database()
-            
-            return count_parts
-            
-        except Exception as e:
-            logger.error(f"Ошибка удаления артикула {artikul_norm}: {e}")
-            raise
-    
-    # ========================================================================
-    # ПОИСК (С КЭШИРОВАНИЕМ И ПОИСКОМ ПО АНАЛОГАМ)
+    # ПОИСК (С КЭШИРОВАНИЕМ)
     # ========================================================================
     def _clean_search_cache(self):
         """Очистка устаревших записей кэша"""
@@ -2187,7 +2568,6 @@ class HighVolumeAutoPartsCatalog:
         if not query or not query.strip():
             return pd.DataFrame()
         
-        # Проверка кэша
         cache_key = hashlib.md5(f"{query}:{limit}".encode()).hexdigest()
         
         if use_cache and cache_key in self._search_cache:
@@ -2200,28 +2580,22 @@ class HighVolumeAutoPartsCatalog:
         
         start_time = time.time()
         
-        # Нормализация запроса
         query_norm = self.normalize_key(pl.Series([query]))[0]
         
-        # Основной поиск через LIKE
         result = self._search_like(query, limit)
         
-        # Если результатов мало или нет, ищем по аналогам
         if result is None or result.empty:
             logger.info(f"🔍 Поиск по аналогам для запроса: {query}")
             result = self._search_by_analog(query_norm, limit)
         
-        # Если все еще нет результатов, ищем по OE номеру через кросс-ссылки
         if result is None or result.empty:
             logger.info(f"🔍 Поиск по OE номеру для запроса: {query}")
             result = self._search_by_oe_number(query_norm, limit)
         
-        # Сохранение в кэш
         if result is not None and not result.empty:
             self._search_cache[cache_key] = (time.time(), result)
             self._clean_search_cache()
         
-        # Обновление метрик
         self.performance_metrics['total_time'] += (time.time() - start_time)
         
         return result if result is not None else pd.DataFrame()
@@ -2229,8 +2603,6 @@ class HighVolumeAutoPartsCatalog:
     def _search_like(self, query: str, limit: int) -> pd.DataFrame:
         """Поиск через LIKE с нормализацией"""
         query_norm = self.normalize_key(pl.Series([query]))[0]
-        
-        # Экранирование спецсимволов для LIKE
         safe_query = query_norm.replace('%', '\\%').replace('_', '\\_')
         
         sql_like = f"""
@@ -2245,6 +2617,7 @@ class HighVolumeAutoPartsCatalog:
                 p.weight,
                 p.dimensions_str,
                 p.image_url,
+                p.barcode,
                 STRING_AGG(DISTINCT o.oe_number, ', ') as oe_numbers,
                 STRING_AGG(DISTINCT o.name, ', ') as oe_names
             FROM parts p
@@ -2256,7 +2629,7 @@ class HighVolumeAutoPartsCatalog:
                 OR o.oe_number_norm LIKE '%' || ? || '%'
                 OR o.name LIKE '%' || ? || '%'
             GROUP BY p.artikul, p.brand, p.description, p.multiplicity,
-                     p.length, p.width, p.height, p.weight, p.dimensions_str, p.image_url
+                     p.length, p.width, p.height, p.weight, p.dimensions_str, p.image_url, p.barcode
             LIMIT {limit}
         """
         
@@ -2267,9 +2640,7 @@ class HighVolumeAutoPartsCatalog:
             return pd.DataFrame()
     
     def _search_by_analog(self, query_norm: str, limit: int) -> pd.DataFrame:
-        """
-        Поиск по аналогам: если запрос не найден напрямую, ищем через связи
-        """
+        """Поиск по аналогам"""
         sql_analog = f"""
             WITH FoundParts AS (
                 SELECT DISTINCT p.artikul_norm, p.brand_norm
@@ -2304,6 +2675,7 @@ class HighVolumeAutoPartsCatalog:
                 p.weight,
                 p.dimensions_str,
                 p.image_url,
+                p.barcode,
                 STRING_AGG(DISTINCT o.oe_number, ', ') as oe_numbers,
                 STRING_AGG(DISTINCT o.name, ', ') as oe_names,
                 'найден по аналогу' as search_type
@@ -2312,7 +2684,7 @@ class HighVolumeAutoPartsCatalog:
             LEFT JOIN cross_references cr ON p.artikul_norm = cr.artikul_norm AND p.brand_norm = cr.brand_norm
             LEFT JOIN oe o ON cr.oe_number_norm = o.oe_number_norm
             GROUP BY p.artikul, p.brand, p.description, p.multiplicity,
-                     p.length, p.width, p.height, p.weight, p.dimensions_str, p.image_url
+                     p.length, p.width, p.height, p.weight, p.dimensions_str, p.image_url, p.barcode
             LIMIT {limit}
         """
         
@@ -2325,9 +2697,7 @@ class HighVolumeAutoPartsCatalog:
             return pd.DataFrame()
     
     def _search_by_oe_number(self, query_norm: str, limit: int) -> pd.DataFrame:
-        """
-        Поиск по OE номеру через кросс-ссылки
-        """
+        """Поиск по OE номеру"""
         sql_oe = f"""
             WITH OEParts AS (
                 SELECT DISTINCT
@@ -2348,6 +2718,7 @@ class HighVolumeAutoPartsCatalog:
                 p.weight,
                 p.dimensions_str,
                 p.image_url,
+                p.barcode,
                 STRING_AGG(DISTINCT o.oe_number, ', ') as oe_numbers,
                 STRING_AGG(DISTINCT o.name, ', ') as oe_names,
                 'найден по OE' as search_type
@@ -2356,7 +2727,7 @@ class HighVolumeAutoPartsCatalog:
             LEFT JOIN cross_references cr ON p.artikul_norm = cr.artikul_norm AND p.brand_norm = cr.brand_norm
             LEFT JOIN oe o ON cr.oe_number_norm = o.oe_number_norm
             GROUP BY p.artikul, p.brand, p.description, p.multiplicity,
-                     p.length, p.width, p.height, p.weight, p.dimensions_str, p.image_url
+                     p.length, p.width, p.height, p.weight, p.dimensions_str, p.image_url, p.barcode
             LIMIT {limit}
         """
         
@@ -2385,7 +2756,6 @@ class HighVolumeAutoPartsCatalog:
                 "SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts)"
             ).fetchone()[0]
             
-            # Ценовая статистика
             price_stats = self.conn.execute("""
                 SELECT 
                     ROUND(AVG(price), 2) as avg_price,
@@ -2400,7 +2770,6 @@ class HighVolumeAutoPartsCatalog:
             stats['max_price'] = price_stats[2] if price_stats[2] else 0
             stats['priced_items'] = price_stats[3] if price_stats[3] else 0
             
-            # Топ брендов
             try:
                 top_brands = self.conn.execute("""
                     SELECT brand, COUNT(*) as cnt 
@@ -2414,7 +2783,6 @@ class HighVolumeAutoPartsCatalog:
             except Exception:
                 stats['top_brands'] = pd.DataFrame()
             
-            # Статистика по категориям
             try:
                 category_stats = self.conn.execute("""
                     SELECT category, COUNT(*) as cnt 
@@ -2427,7 +2795,6 @@ class HighVolumeAutoPartsCatalog:
             except Exception:
                 stats['category_stats'] = pd.DataFrame()
             
-            # Статистика связей
             cross_coverage = self.conn.execute("""
                 SELECT 
                     COUNT(DISTINCT p.artikul_norm || p.brand_norm) as total_parts,
@@ -2444,11 +2811,9 @@ class HighVolumeAutoPartsCatalog:
             else:
                 stats['link_percentage'] = 0
             
-            # Размер базы данных
             if self.db_path.exists():
                 stats['db_size_mb'] = round(self.db_path.stat().st_size / (1024 * 1024), 2)
             
-            # Метрики производительности
             stats['performance'] = self.performance_metrics.copy()
             stats['cache_hit_rate'] = (
                 self.performance_metrics['cache_hits'] / max(self.performance_metrics['queries'], 1) * 100
@@ -2458,6 +2823,64 @@ class HighVolumeAutoPartsCatalog:
             logger.error(f"Ошибка сбора статистики: {e}")
         
         return stats
+    
+    # ========================================================================
+    # УПРАВЛЕНИЕ ДАННЫМИ
+    # ========================================================================
+    def delete_by_brand(self, brand_norm: str) -> int:
+        """Удаление записей по бренду с каскадным удалением связей"""
+        try:
+            count_parts = self.conn.execute(
+                "SELECT COUNT(*) FROM parts WHERE brand_norm = ?", [brand_norm]).fetchone()[0]
+            
+            if count_parts == 0:
+                logger.info(f"Нет записей для бренда: {brand_norm}")
+                return 0
+            
+            self.conn.execute("""
+                DELETE FROM prices WHERE (artikul_norm, brand_norm) IN (
+                    SELECT artikul_norm, brand_norm FROM parts WHERE brand_norm = ?
+                )
+            """, [brand_norm])
+            
+            self.conn.execute("""
+                DELETE FROM cross_references WHERE (artikul_norm, brand_norm) IN (
+                    SELECT artikul_norm, brand_norm FROM parts WHERE brand_norm = ?
+                )
+            """, [brand_norm])
+            
+            self.conn.execute("DELETE FROM parts WHERE brand_norm = ?", [brand_norm])
+            
+            self.vacuum_database()
+            
+            logger.info(f"Удалено {count_parts} записей бренда: {brand_norm}")
+            return count_parts
+            
+        except Exception as e:
+            logger.error(f"Ошибка удаления бренда {brand_norm}: {e}")
+            raise
+    
+    def delete_by_artikul(self, artikul_norm: str) -> int:
+        """Удаление записей по артикулу"""
+        try:
+            count_parts = self.conn.execute(
+                "SELECT COUNT(*) FROM parts WHERE artikul_norm = ?", [artikul_norm]).fetchone()[0]
+            
+            if count_parts == 0:
+                logger.info(f"Нет записей для артикула: {artikul_norm}")
+                return 0
+            
+            self.conn.execute("DELETE FROM prices WHERE artikul_norm = ?", [artikul_norm])
+            self.conn.execute("DELETE FROM cross_references WHERE artikul_norm = ?", [artikul_norm])
+            self.conn.execute("DELETE FROM parts WHERE artikul_norm = ?", [artikul_norm])
+            
+            self.vacuum_database()
+            
+            return count_parts
+            
+        except Exception as e:
+            logger.error(f"Ошибка удаления артикула {artikul_norm}: {e}")
+            raise
     
     # ========================================================================
     # ИНТЕРФЕЙСЫ ПОЛЬЗОВАТЕЛЯ
@@ -2470,101 +2893,285 @@ class HighVolumeAutoPartsCatalog:
             "SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts)"
         ).fetchone()[0]
         
-        col1, col2, col3 = st.columns(3)
+        if total == 0:
+            st.warning("Нет данных для экспорта")
+            return
+        
+        col1, col2 = st.columns(2)
         col1.metric("Всего товаров", f"{total:,}")
         
-        # Формат экспорта
-        format_choice = st.radio(
-            "Формат экспорта:",
-            ["CSV (с разделителем ;)", "Excel (.xlsx)", "Parquet"],
-            horizontal=True
-        )
-        
-        # Настройки экспорта
-        with st.expander("⚙️ Настройки экспорта", expanded=True):
+        # ============================================================
+        # ОСНОВНЫЕ НАСТРОЙКИ
+        # ============================================================
+        with st.expander("⚙️ Основные настройки", expanded=True):
             col1, col2 = st.columns(2)
             
             with col1:
-                st.subheader("Колонки для экспорта")
-                all_columns = [
-                    "Артикул бренда", "Бренд", "Наименование", "Применимость", 
-                    "Описание", "Категория товара", "Кратность", "Длинна", 
-                    "Ширина", "Высота", "Вес", "Длинна/Ширина/Высота", 
-                    "OE номер", "аналоги", "Ссылка на изображение", "Цена", "Валюта"
-                ]
+                # Формат экспорта
+                format_type = st.selectbox(
+                    "Формат файла:",
+                    ["CSV", "Excel (.xlsx)", "JSON"],
+                    index=0
+                )
                 
-                selected_columns = st.multiselect(
-                    "Выберите колонки (пусто = все):",
-                    all_columns,
-                    default=["Артикул бренда", "Бренд", "Наименование", "Цена"]
+                # Формат для маркетплейса
+                market_format = st.selectbox(
+                    "Площадка (форматирование):",
+                    ["Без форматирования", "Yandex Market", "Ozon", "Avito", "СберМегаМаркет"],
+                    index=0
+                )
+                
+                market_format_map = {
+                    "Без форматирования": None,
+                    "Yandex Market": "yandex",
+                    "Ozon": "ozon",
+                    "Avito": "avito",
+                    "СберМегаМаркет": "sber"
+                }
+                market_format_key = market_format_map.get(market_format)
+            
+            with col2:
+                # Настройки CSV
+                csv_separator = st.selectbox(
+                    "Разделитель столбцов:",
+                    [";", ",", "\t"],
+                    index=0
+                )
+                
+                encoding = st.selectbox(
+                    "Кодировка:",
+                    ["windows-1251", "utf-8", "cp866"],
+                    index=0
+                )
+                
+                decimal_separator = st.selectbox(
+                    "Десятичный разделитель:",
+                    [".", ","],
+                    index=0
+                )
+        
+        # ============================================================
+        # НАСТРОЙКИ РАЗБИЕНИЯ
+        # ============================================================
+        with st.expander("📦 Разбиение и архивация", expanded=False):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                split_size = st.number_input(
+                    "Разбить на части (строк):",
+                    min_value=0,
+                    max_value=1000000,
+                    value=500000,
+                    step=10000,
+                    help="0 - не разбивать"
                 )
             
             with col2:
-                st.subheader("Параметры")
-                include_prices = st.checkbox("Включить цены", value=True)
-                apply_markup = st.checkbox(
-                    "Применить наценку", 
-                    value=True, 
-                    disabled=not include_prices
+                zip_archive = st.checkbox(
+                    "Упаковать все части в архив (.zip)",
+                    value=False
                 )
-                apply_exclusions = st.checkbox("Применить исключения", value=True)
+        
+        # ============================================================
+        # НАСТРОЙКИ ФОРМАТИРОВАНИЯ
+        # ============================================================
+        with st.expander("🔤 Форматирование", expanded=False):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                add_apostrophe = st.checkbox(
+                    "Апостроф в номер",
+                    value=True,
+                    help="Добавляет ' перед номером для предотвращения преобразования в Excel"
+                )
                 
-                if include_prices and apply_markup:
-                    st.info(f"Глобальная наценка: {self.price_rules.get('global_markup', 0) * 100:.1f}%")
+                use_crlf = st.checkbox(
+                    "Использовать CRLF для переноса строк",
+                    value=True
+                )
+            
+            with col2:
+                remove_semicolon = st.checkbox(
+                    "Удалять символ ; из названий",
+                    value=False,
+                    help="Удаляет точки с запятой из текстовых полей"
+                )
+                
+                include_prices = st.checkbox(
+                    "Включить цены",
+                    value=True
+                )
         
-        # Предпросмотр настроек связей
-        with st.expander("🔗 Настройки связей (для экспорта)", expanded=False):
-            st.info("Настройки из раздела 'Управление связями'")
-            st.write(f"Глубина связей: {self.link_rules.get('max_link_depth', 2)}")
-            st.write(f"Использовать кросс-ссылки: {self.link_rules.get('use_cross_references', True)}")
-            st.write(f"Только OE связи: {self.link_rules.get('link_by_oe_only', False)}")
+        # ============================================================
+        # ШАБЛОНЫ
+        # ============================================================
+        with st.expander("📝 Шаблоны названий и описаний", expanded=False):
+            st.info("Используйте переменные в формате {{variable_name}}")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                template_name = st.text_area(
+                    "Шаблон названия:",
+                    value=self.export_handler.template_engine.get_default_name_template(),
+                    height=100,
+                    help="Доступные переменные: {{oem}}, {{make_name}}, {{detail_name}}, {{min_qnt}}, {{barcode}} и др."
+                )
+            
+            with col2:
+                template_description = st.text_area(
+                    "Шаблон описания:",
+                    value=self.export_handler.template_engine.get_default_description_template(),
+                    height=150,
+                    help="Доступные переменные: {{oem}}, {{make_name}}, {{detail_name}}, {{product_description}}, {{cross}} и др."
+                )
+            
+            # Список доступных переменных
+            with st.expander("📋 Доступные переменные", expanded=False):
+                variables = [
+                    ("{{oem}}", "Номер детали"),
+                    ("{{source_oem}}", "Неформатированный номер из прайс-листа"),
+                    ("{{make_name}}", "Бренд"),
+                    ("{{detail_name}}", "Название детали"),
+                    ("{{cross}}", "Кроссы из базы"),
+                    ("{{barcode}}", "EAN13 штрих-код"),
+                    ("{{qnt}}", "Количество"),
+                    ("{{min_qnt}}", "Минимальное количество"),
+                    ("{{price}}", "Цена"),
+                    ("{{currency}}", "Валюта"),
+                    ("{{length}}", "Длина, см"),
+                    ("{{width}}", "Ширина, см"),
+                    ("{{height}}", "Высота, см"),
+                    ("{{weight}}", "Вес, кг"),
+                    ("{{category}}", "Категория"),
+                    ("{{applicability}}", "Применимость"),
+                    ("{{product_description}}", "Описание товара"),
+                    ("{{image_url}}", "Ссылка на изображение"),
+                    ("{{additional_images}}", "Дополнительные изображения"),
+                    ("{{properties_1}}", "Свойство 1"),
+                    ("{{properties_2}}", "Свойство 2"),
+                    ("{{properties_3}}", "Свойство 3"),
+                    ("{{properties_4}}", "Свойство 4"),
+                    ("{{properties_5}}", "Свойство 5"),
+                    ("{{properties_6}}", "Свойство 6"),
+                ]
+                
+                var_df = pd.DataFrame(variables, columns=["Переменная", "Описание"])
+                st.dataframe(var_df, use_container_width=True, hide_index=True)
         
-        # Кнопка экспорта
+        # ============================================================
+        # ВЫБОР КОЛОНОК
+        # ============================================================
+        with st.expander("📋 Настройка колонок", expanded=True):
+            st.subheader("Выберите колонки для экспорта")
+            
+            # Все доступные колонки
+            all_columns = ExportColumnConfig.ALL_COLUMNS
+            
+            # Создание категорий для выбора
+            selected_columns = []
+            
+            for category, columns in all_columns.items():
+                st.markdown(f"**{category}**")
+                
+                # Поиск по колонкам
+                cols_per_row = 4
+                col_container = st.columns(cols_per_row)
+                
+                for idx, col in enumerate(columns):
+                    col_idx = idx % cols_per_row
+                    checked = col_container[col_idx].checkbox(
+                        col,
+                        value=True,
+                        key=f"col_{col}_{idx}"
+                    )
+                    if checked:
+                        selected_columns.append(col)
+                
+                st.markdown("---")
+            
+            # Отображение выбранных колонок
+            st.info(f"Выбрано колонок: {len(selected_columns)}")
+            
+            # Возможность сортировки колонок
+            if len(selected_columns) > 1:
+                st.subheader("Порядок колонок")
+                
+                # Сортировка через перетаскивание (замена - через selectbox)
+                sorted_columns = st.multiselect(
+                    "Перетащите для изменения порядка:",
+                    selected_columns,
+                    default=selected_columns,
+                    key="column_order"
+                )
+                
+                if sorted_columns:
+                    selected_columns = sorted_columns
+        
+        # ============================================================
+        # ДОПОЛНИТЕЛЬНЫЕ НАСТРОЙКИ
+        # ============================================================
+        with st.expander("🔧 Дополнительные настройки", expanded=False):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                apply_markup = st.checkbox(
+                    "Применить наценку",
+                    value=True,
+                    help=f"Глобальная наценка: {self.price_rules.get('global_markup', 0) * 100:.1f}%"
+                )
+            
+            with col2:
+                apply_exclusions = st.checkbox(
+                    "Применить исключения",
+                    value=True,
+                    help=f"Активно правил: {len(self.exclusion_rules)}"
+                )
+        
+        # ============================================================
+        # ИМЯ ФАЙЛА И ЭКСПОРТ
+        # ============================================================
+        filename = st.text_input(
+            "Имя файла:",
+            value=f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            help="Без расширения"
+        )
+        
         if st.button("🚀 Экспортировать", type="primary", use_container_width=True):
-            if total == 0:
-                st.warning("Нет данных для экспорта")
-                return
+            # Определение расширения
+            ext_map = {
+                "CSV": "csv",
+                "Excel (.xlsx)": "xlsx",
+                "JSON": "json"
+            }
+            ext = ext_map.get(format_type, "csv")
             
-            # Определение расширения файла
-            if "CSV" in format_choice:
-                ext = "csv"
-            elif "Excel" in format_choice:
-                ext = "xlsx"
-            else:
-                ext = "parquet"
-            
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_filename = f"export_{timestamp}.{ext}"
+            output_filename = f"{filename}.{ext}"
             output_path = self.data_dir / output_filename
             
             with st.spinner(f"⏳ Генерация файла {output_filename}..."):
                 progress_bar = st.progress(0)
                 
                 try:
-                    if ext == "csv":
-                        success = self.export_to_csv_optimized(
-                            str(output_path),
-                            selected_columns if selected_columns else None,
-                            include_prices,
-                            apply_markup,
-                            apply_exclusions
-                        )
-                    elif ext == "xlsx":
-                        success = self.export_to_excel_optimized(
-                            str(output_path),
-                            selected_columns if selected_columns else None,
-                            include_prices,
-                            apply_markup,
-                            apply_exclusions
-                        )
-                    else:
-                        success = self.export_to_parquet(
-                            str(output_path),
-                            selected_columns if selected_columns else None,
-                            include_prices,
-                            apply_markup,
-                            apply_exclusions
-                        )
+                    success = self.export_data(
+                        output_path=str(output_path),
+                        selected_columns=selected_columns if selected_columns else None,
+                        include_prices=include_prices,
+                        apply_markup=apply_markup,
+                        apply_exclusions=apply_exclusions,
+                        format_type=format_type.lower().replace(" ", "").replace(".", ""),
+                        market_format=market_format_key,
+                        template_name=template_name if template_name else None,
+                        template_description=template_description if template_description else None,
+                        csv_separator=csv_separator,
+                        decimal_separator=decimal_separator,
+                        encoding=encoding,
+                        add_apostrophe=add_apostrophe,
+                        use_crlf=use_crlf,
+                        remove_semicolon=remove_semicolon,
+                        split_size=split_size,
+                        zip_archive=zip_archive
+                    )
                     
                     progress_bar.progress(1.0)
                     
@@ -2586,11 +3193,14 @@ class HighVolumeAutoPartsCatalog:
                         
                         st.session_state.export_history.append({
                             'filename': output_filename,
-                            'timestamp': timestamp,
+                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                             'size_mb': round(len(file_data) / (1024 * 1024), 2),
-                            'format': ext,
-                            'rows': total
+                            'format': format_type,
+                            'rows': total,
+                            'marketplace': market_format if market_format != "Без форматирования" else "Стандартный"
                         })
+                        
+                        st.success(f"✅ Экспорт успешно создан!")
                     
                 except Exception as e:
                     st.error(f"❌ Ошибка экспорта: {str(e)}")
@@ -2599,14 +3209,32 @@ class HighVolumeAutoPartsCatalog:
                 finally:
                     progress_bar.empty()
         
-        # История экспортов
+        # ============================================================
+        # ИСТОРИЯ ЭКСПОРТОВ
+        # ============================================================
         if 'export_history' in st.session_state and st.session_state.export_history:
             with st.expander("📋 История экспортов", expanded=False):
                 history_df = pd.DataFrame(st.session_state.export_history)
-                st.dataframe(history_df, use_container_width=True, hide_index=True)
+                st.dataframe(
+                    history_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "filename": "Имя файла",
+                        "timestamp": "Время",
+                        "size_mb": st.column_config.NumberColumn("Размер, МБ", format="%.2f"),
+                        "format": "Формат",
+                        "rows": "Записей",
+                        "marketplace": "Площадка"
+                    }
+                )
+                
+                if st.button("🗑️ Очистить историю"):
+                    st.session_state.export_history = []
+                    st.rerun()
     
     def show_price_settings(self):
-        """Расширенные настройки цен"""
+        """Настройки цен"""
         st.header("💰 Управление ценами и наценками")
         
         tabs = st.tabs(["Общие настройки", "Наценки по брендам", "Ограничения"])
@@ -2622,8 +3250,7 @@ class HighVolumeAutoPartsCatalog:
                     min_value=0.0,
                     max_value=1000.0,
                     value=self.price_rules.get('global_markup', 0.2) * 100,
-                    step=1.0,
-                    help="Процент наценки, применяемый ко всем товарам"
+                    step=1.0
                 )
                 self.price_rules['global_markup'] = global_markup / 100
             
@@ -2658,11 +3285,9 @@ class HighVolumeAutoPartsCatalog:
         
         with tabs[1]:
             st.subheader("Наценки по брендам")
-            st.info("Индивидуальные наценки для конкретных брендов")
             
             brand_markups = self.price_rules.get('brand_markups', {})
             
-            # Список брендов из базы
             try:
                 brands = self.conn.execute(
                     "SELECT DISTINCT brand FROM parts WHERE brand IS NOT NULL ORDER BY brand"
@@ -2672,7 +3297,6 @@ class HighVolumeAutoPartsCatalog:
                 available_brands = []
             
             if available_brands:
-                # Отображение текущих наценок
                 if brand_markups:
                     markup_df = pd.DataFrame([
                         {"Бренд": brand, "Наценка (%)": f"{markup * 100:.1f}%"}
@@ -2680,7 +3304,6 @@ class HighVolumeAutoPartsCatalog:
                     ])
                     st.dataframe(markup_df, use_container_width=True, hide_index=True)
                 
-                # Добавление/редактирование наценки
                 st.markdown("---")
                 col1, col2, col3 = st.columns([2, 1, 1])
                 
@@ -2710,7 +3333,6 @@ class HighVolumeAutoPartsCatalog:
                         st.success(f"✅ Наценка для {selected_brand}: {new_markup:.1f}%")
                         st.rerun()
                 
-                # Удаление наценки
                 if brand_markups:
                     brand_to_remove = st.selectbox(
                         "Удалить наценку для бренда:",
@@ -2734,8 +3356,7 @@ class HighVolumeAutoPartsCatalog:
                     "Минимальная цена:",
                     min_value=0.0,
                     value=float(self.price_rules.get('min_price', 0)),
-                    step=10.0,
-                    help="Товары с ценой ниже будут исключены"
+                    step=10.0
                 )
                 self.price_rules['min_price'] = min_price
             
@@ -2744,211 +3365,260 @@ class HighVolumeAutoPartsCatalog:
                     "Максимальная цена:",
                     min_value=0.0,
                     value=float(self.price_rules.get('max_price', 99999)),
-                    step=1000.0,
-                    help="Товары с ценой выше будут исключены"
+                    step=1000.0
                 )
                 self.price_rules['max_price'] = max_price
         
-        # Сохранение всех настроек
         if st.button("💾 Сохранить все настройки цен", type="primary"):
             self.save_price_rules()
             st.success("✅ Все настройки цен сохранены")
     
-    def show_link_rules_interface(self):
-        """Интерфейс управления правилами связывания"""
-        st.header("🔗 Управление связями данных")
-        st.info("Настройте правила связывания OE номеров с артикулами")
+    def show_statistics(self):
+        """Интерфейс статистики"""
+        st.header("📈 Статистика и метрики")
         
-        col1, col2 = st.columns(2)
+        stats = self.get_statistics()
         
-        with col1:
-            st.subheader("Основные настройки")
-            
-            use_cross = st.checkbox(
-                "Использовать кросс-ссылки",
-                value=self.link_rules.get('use_cross_references', True),
-                help="Связывать артикулы через OE номера"
-            )
-            self.link_rules['use_cross_references'] = use_cross
-            
-            if use_cross:
-                max_depth = st.slider(
-                    "Глубина связей:",
-                    min_value=1,
-                    max_value=3,
-                    value=self.link_rules.get('max_link_depth', 2),
-                    help="1 - только прямые связи, 2-3 - включая аналоги"
-                )
-                self.link_rules['max_link_depth'] = max_depth
-                
-                link_by_oe = st.checkbox(
-                    "Связывать только через OE",
-                    value=self.link_rules.get('link_by_oe_only', False),
-                    help="Не использовать другие типы связей"
-                )
-                self.link_rules['link_by_oe_only'] = link_by_oe
-            
-            prefer_original = st.checkbox(
-                "Предпочитать оригинальные OE",
-                value=self.link_rules.get('prefer_original_oe', True),
-                help="Приоритет оригинальных номеров над аналогами"
-            )
-            self.link_rules['prefer_original_oe'] = prefer_original
+        if not stats:
+            st.error("Ошибка сбора статистики")
+            return
         
-        with col2:
-            st.subheader("Дополнительные связи")
-            
-            use_dimensions = st.checkbox(
-                "Связывать по габаритам",
-                value=self.link_rules.get('use_dimensions_linking', True),
-                help="Дополнять информацию о размерах из связанных товаров"
-            )
-            self.link_rules['use_dimensions_linking'] = use_dimensions
-            
-            use_barcode = st.checkbox(
-                "Связывать по штрих-кодам",
-                value=self.link_rules.get('use_barcode_linking', True)
-            )
-            self.link_rules['use_barcode_linking'] = use_barcode
-            
-            use_price = st.checkbox(
-                "Связывать цены",
-                value=self.link_rules.get('use_price_linking', True)
-            )
-            self.link_rules['use_price_linking'] = use_price
+        # Основные метрики
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Уникальных товаров", f"{stats.get('unique_parts', 0):,}")
+        col2.metric("Брендов", f"{stats.get('brands', 0):,}")
+        col3.metric("OE номеров", f"{stats.get('oe', 0):,}")
+        col4.metric("Кросс-ссылок", f"{stats.get('cross', 0):,}")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Средняя цена", f"{stats.get('avg_price', 0):,.2f} ₽")
+        col2.metric("Мин. цена", f"{stats.get('min_price', 0):,.2f} ₽")
+        col3.metric("Макс. цена", f"{stats.get('max_price', 0):,.2f} ₽")
+        col4.metric("Охват связей", f"{stats.get('link_percentage', 0)}%")
         
         st.markdown("---")
         
-        # Приоритетные бренды
-        st.subheader("🏆 Приоритетные бренды для связывания")
+        # Графики и таблицы
+        tab1, tab2, tab3 = st.tabs(["📊 Распределение", "🏆 Топ брендов", "⚡ Производительность"])
         
-        try:
-            brands = self.conn.execute(
-                "SELECT DISTINCT brand FROM parts WHERE brand IS NOT NULL ORDER BY brand"
-            ).fetchall()
-            available_brands = [row[0] for row in brands]
-        except Exception:
-            available_brands = []
-        
-        if available_brands:
-            priority_brands = self.link_rules.get('priority_brands_for_linking', [])
-            exclude_brands = self.link_rules.get('exclude_brands_from_linking', [])
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("**Приоритетные бренды:**")
-                new_priority = st.multiselect(
-                    "Выберите приоритетные бренды:",
-                    available_brands,
-                    default=priority_brands,
-                    help="Товары этих брендов будут в приоритете при связывании"
+        with tab1:
+            if 'category_stats' in stats and not stats['category_stats'].empty:
+                st.subheader("Распределение по категориям")
+                st.dataframe(
+                    stats['category_stats'],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "category": "Категория",
+                        "cnt": "Количество"
+                    }
                 )
-                self.link_rules['priority_brands_for_linking'] = new_priority
-            
-            with col2:
-                st.markdown("**Исключенные бренды:**")
-                new_exclude = st.multiselect(
-                    "Выберите исключаемые бренды:",
-                    available_brands,
-                    default=exclude_brands,
-                    help="Товары этих брендов не будут участвовать в связывании"
+                st.bar_chart(
+                    stats['category_stats'].set_index('category')['cnt']
                 )
-                self.link_rules['exclude_brands_from_linking'] = new_exclude
+            else:
+                st.info("Нет данных о категориях")
         
-        # Сохранение
-        if st.button("💾 Сохранить правила связывания", type="primary"):
-            self.save_link_rules()
-            st.success("✅ Правила связывания сохранены")
+        with tab2:
+            if 'top_brands' in stats and not stats['top_brands'].empty:
+                st.subheader("Топ 10 брендов")
+                st.dataframe(
+                    stats['top_brands'],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "brand": "Бренд",
+                        "cnt": "Количество товаров"
+                    }
+                )
+            else:
+                st.info("Нет данных о брендах")
+        
+        with tab3:
+            st.subheader("Метрики производительности")
+            
+            perf = stats.get('performance', {})
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Всего запросов", perf.get('queries', 0))
+            col2.metric("Попаданий в кэш", perf.get('cache_hits', 0))
+            col3.metric("Эффективность кэша", f"{stats.get('cache_hit_rate', 0):.1f}%")
+            
+            if 'db_size_mb' in stats:
+                st.info(f"💾 Размер базы данных: {stats['db_size_mb']:.1f} МБ")
+            
+            if st.button("🔍 Проверить целостность БД"):
+                with st.spinner("Проверка базы данных..."):
+                    health = self.check_database_health()
+                    
+                    if health.get('corruption_detected'):
+                        st.error("⚠️ Обнаружены проблемы с целостностью данных!")
+                    else:
+                        st.success("✅ База данных в порядке")
+                    
+                    st.json(health)
     
-    def show_column_mapping_interface(self):
-        """Интерфейс управления маппингом колонок"""
-        st.header("📋 Управление маппингом колонок")
-        st.info("Настройте соответствие названий колонок в загружаемых файлах")
+    def show_data_management(self):
+        """Интерфейс управления данными"""
+        st.header("🔧 Управление данными")
         
-        # Выбор типа файла для редактирования
-        file_types = list(self.column_mapping_config.keys())
-        selected_type = st.selectbox(
-            "Тип файла:",
-            file_types,
-            format_func=lambda x: {
-                'oe': 'OE данные',
-                'cross': 'Кросс-ссылки',
-                'prices': 'Цены',
-                'dimensions': 'Габариты',
-                'barcode': 'Штрих-коды',
-                'images': 'Изображения'
-            }.get(x, x)
+        management_option = st.radio(
+            "Выберите действие:",
+            [
+                "🗑️ Удаление данных",
+                "💰 Цены и наценки",
+                "🚫 Исключения",
+                "🗂️ Категории",
+                "🔗 Управление связями",
+                "📋 Маппинг колонок",
+                "🔍 Диагностика"
+            ],
+            horizontal=False
         )
         
-        if selected_type in self.column_mapping_config:
-            st.subheader(f"Поля для типа: {selected_type}")
-            
-            config = self.column_mapping_config[selected_type]
-            
-            # Отображение текущего маппинга
-            mapping_data = []
-            for field, variants in config.items():
-                mapping_data.append({
-                    "Поле": field,
-                    "Варианты названий": ", ".join(variants[:5]) + ("..." if len(variants) > 5 else "")
-                })
-            
-            st.dataframe(
-                pd.DataFrame(mapping_data),
-                use_container_width=True,
-                hide_index=True
-            )
-            
-            st.markdown("---")
-            
-            # Редактирование конкретного поля
-            st.subheader("Редактировать поле")
-            
-            field_to_edit = st.selectbox(
-                "Выберите поле:",
-                list(config.keys())
-            )
-            
-            if field_to_edit:
-                current_variants = config[field_to_edit]
-                
-                new_variants_text = st.text_area(
-                    "Варианты названий (по одному на строку):",
-                    value="\n".join(current_variants),
-                    height=200,
-                    help="Добавьте все возможные варианты названий колонок"
-                )
-                
-                if st.button("💾 Сохранить варианты"):
-                    new_variants = [v.strip() for v in new_variants_text.split("\n") if v.strip()]
-                    config[field_to_edit] = new_variants
-                    self.save_column_mapping_config()
-                    st.success(f"✅ Варианты для '{field_to_edit}' сохранены")
-                    st.rerun()
-            
-            st.markdown("---")
-            
-            # Добавление нового поля
-            with st.expander("➕ Добавить новое поле"):
-                new_field_name = st.text_input("Название поля:")
-                new_field_variants = st.text_area(
-                    "Варианты названий:",
-                    height=100,
-                    placeholder="Вариант 1\nВариант 2\n..."
-                )
-                
-                if st.button("Добавить поле"):
-                    if new_field_name and new_field_variants:
-                        variants = [v.strip() for v in new_field_variants.split("\n") if v.strip()]
-                        config[new_field_name] = variants
-                        self.save_column_mapping_config()
-                        st.success(f"✅ Поле '{new_field_name}' добавлено")
-                        st.rerun()
-                    else:
-                        st.warning("Заполните все поля")
+        if management_option == "🗑️ Удаление данных":
+            self._show_delete_interface()
+        elif management_option == "💰 Цены и наценки":
+            self.show_price_settings()
+        elif management_option == "🚫 Исключения":
+            self._show_exclusion_settings()
+        elif management_option == "🗂️ Категории":
+            self._show_category_mapping()
+        elif management_option == "🔗 Управление связями":
+            self._show_link_rules_interface()
+        elif management_option == "📋 Маппинг колонок":
+            self._show_column_mapping_interface()
+        elif management_option == "🔍 Диагностика":
+            self._show_diagnostics()
     
-    def show_exclusion_settings(self):
+    def _show_delete_interface(self):
+        """Интерфейс удаления данных"""
+        st.subheader("🗑️ Удаление данных")
+        st.warning("⚠️ Внимание! Операции удаления необратимы!")
+        
+        delete_option = st.radio(
+            "Тип удаления:",
+            ["По бренду", "По артикулу", "Очистить все данные"],
+            horizontal=True
+        )
+        
+        if delete_option == "По бренду":
+            try:
+                brands = self.conn.execute(
+                    "SELECT DISTINCT brand FROM parts WHERE brand IS NOT NULL ORDER BY brand"
+                ).fetchall()
+                available_brands = [row[0] for row in brands]
+                
+                if available_brands:
+                    selected_brand = st.selectbox("Выберите бренд для удаления:", available_brands)
+                    
+                    count = self.conn.execute(
+                        "SELECT COUNT(*) FROM parts WHERE brand = ?", [selected_brand]
+                    ).fetchone()[0]
+                    
+                    st.info(f"Будет удалено {count:,} записей бренда '{selected_brand}'")
+                    
+                    col1, col2 = st.columns([1, 3])
+                    
+                    with col1:
+                        confirmed = st.checkbox("Подтверждаю")
+                    
+                    with col2:
+                        if st.button("🗑️ Удалить", type="primary", disabled=not confirmed):
+                            if confirmed:
+                                brand_norm = self.normalize_key(pl.Series([selected_brand]))[0]
+                                deleted = self.delete_by_brand(brand_norm)
+                                st.success(f"✅ Удалено {deleted:,} записей")
+                                st.rerun()
+                else:
+                    st.info("Нет данных для удаления")
+                    
+            except Exception as e:
+                st.error(f"Ошибка: {e}")
+        
+        elif delete_option == "По артикулу":
+            artikul_input = st.text_input("Введите артикул для удаления:")
+            
+            if artikul_input:
+                artikul_norm = self.normalize_key(pl.Series([artikul_input]))[0]
+                
+                count = self.conn.execute(
+                    "SELECT COUNT(*) FROM parts WHERE artikul_norm = ?", [artikul_norm]
+                ).fetchone()[0]
+                
+                if count > 0:
+                    st.info(f"Найдено {count:,} записей для артикула '{artikul_input}'")
+                    
+                    preview = self.conn.execute("""
+                        SELECT p.artikul, p.brand, COUNT(cr.oe_number_norm) as oe_count
+                        FROM parts p
+                        LEFT JOIN cross_references cr ON p.artikul_norm = cr.artikul_norm 
+                            AND p.brand_norm = cr.brand_norm
+                        WHERE p.artikul_norm = ?
+                        GROUP BY p.artikul, p.brand
+                    """, [artikul_norm]).pl()
+                    
+                    if not preview.is_empty():
+                        st.dataframe(preview.to_pandas(), use_container_width=True, hide_index=True)
+                    
+                    confirmed = st.checkbox("Подтверждаю удаление")
+                    
+                    if st.button("🗑️ Удалить", type="primary", disabled=not confirmed):
+                        if confirmed:
+                            deleted = self.delete_by_artikul(artikul_norm)
+                            st.success(f"✅ Удалено {deleted:,} записей")
+                            st.rerun()
+                else:
+                    st.warning(f"Артикул '{artikul_input}' не найден")
+        
+        elif delete_option == "Очистить все данные":
+            st.error("🚨 Эта операция удалит ВСЕ данные из базы!")
+            
+            parts_count = self.conn.execute("SELECT COUNT(*) FROM parts").fetchone()[0]
+            oe_count = self.conn.execute("SELECT COUNT(*) FROM oe").fetchone()[0]
+            cross_count = self.conn.execute("SELECT COUNT(*) FROM cross_references").fetchone()[0]
+            prices_count = self.conn.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
+            
+            st.info(f"""
+            Будут удалены все записи из таблиц:
+            - Parts: {parts_count:,} записей
+            - OE: {oe_count:,} записей
+            - Cross References: {cross_count:,} записей
+            - Prices: {prices_count:,} записей
+            """)
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                confirm1 = st.checkbox("Я понимаю последствия")
+            
+            with col2:
+                confirm2 = st.checkbox("Данные нельзя восстановить")
+            
+            with col3:
+                if st.button("💀 Удалить все данные", type="primary", 
+                            disabled=not (confirm1 and confirm2),
+                            use_container_width=True):
+                    if confirm1 and confirm2:
+                        try:
+                            backup_path = self.data_dir / f"backup_before_clean_{datetime.now().strftime('%Y%m%d_%H%M%S')}.duckdb"
+                            shutil.copy2(self.db_path, backup_path)
+                            
+                            self.conn.execute("DELETE FROM prices")
+                            self.conn.execute("DELETE FROM cross_references")
+                            self.conn.execute("DELETE FROM oe")
+                            self.conn.execute("DELETE FROM parts")
+                            
+                            self.vacuum_database()
+                            
+                            st.success(f"✅ Все данные удалены. Бэкап сохранен: {backup_path.name}")
+                            st.rerun()
+                            
+                        except Exception as e:
+                            st.error(f"Ошибка при удалении: {e}")
+    
+    def _show_exclusion_settings(self):
+        """Настройки исключений"""
         st.header("🚫 Управление исключениями при экспорте")
         st.info("Товары, содержащие эти слова в названии, будут исключены из экспорта")
         
@@ -2970,7 +3640,6 @@ class HighVolumeAutoPartsCatalog:
             if self.exclusion_rules:
                 st.metric("Правил исключений", len(self.exclusion_rules))
                 
-                # Предпросмотр влияния
                 try:
                     for rule in self.exclusion_rules[:10]:
                         count = self.conn.execute("""
@@ -2997,7 +3666,8 @@ class HighVolumeAutoPartsCatalog:
             self.save_exclusion_rules()
             st.success("✅ Правила исключения сохранены")
     
-    def show_category_mapping(self):
+    def _show_category_mapping(self):
+        """Настройки категорий"""
         st.header("🗂️ Управление категориями товаров")
         st.info("Настройте соответствие между названиями товаров и категориями")
         
@@ -3028,7 +3698,6 @@ class HighVolumeAutoPartsCatalog:
                 )
             
             with col_b:
-                # Предопределенные категории
                 default_categories = [
                     'Охлаждение', 'Подвеска', 'Фильтры', 'Тормоза',
                     'Двигатель', 'Трансмиссия', 'Электрика', 'Рулевое',
@@ -3104,259 +3773,193 @@ class HighVolumeAutoPartsCatalog:
                 except Exception as e:
                     st.error(f"Ошибка загрузки: {e}")
     
-    def show_statistics(self):
-        st.header("📈 Статистика и метрики")
+    def _show_link_rules_interface(self):
+        """Настройки связей"""
+        st.header("🔗 Управление связями данных")
+        st.info("Настройте правила связывания OE номеров с артикулами")
         
-        stats = self.get_statistics()
+        col1, col2 = st.columns(2)
         
-        if not stats:
-            st.error("Ошибка сбора статистики")
-            return
+        with col1:
+            st.subheader("Основные настройки")
+            
+            use_cross = st.checkbox(
+                "Использовать кросс-ссылки",
+                value=self.link_rules.get('use_cross_references', True)
+            )
+            self.link_rules['use_cross_references'] = use_cross
+            
+            if use_cross:
+                max_depth = st.slider(
+                    "Глубина связей:",
+                    min_value=1,
+                    max_value=3,
+                    value=self.link_rules.get('max_link_depth', 2)
+                )
+                self.link_rules['max_link_depth'] = max_depth
+                
+                link_by_oe = st.checkbox(
+                    "Связывать только через OE",
+                    value=self.link_rules.get('link_by_oe_only', False)
+                )
+                self.link_rules['link_by_oe_only'] = link_by_oe
+            
+            prefer_original = st.checkbox(
+                "Предпочитать оригинальные OE",
+                value=self.link_rules.get('prefer_original_oe', True)
+            )
+            self.link_rules['prefer_original_oe'] = prefer_original
         
-        # Основные метрики
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Уникальных товаров", f"{stats.get('unique_parts', 0):,}")
-        col2.metric("Брендов", f"{stats.get('brands', 0):,}")
-        col3.metric("OE номеров", f"{stats.get('oe', 0):,}")
-        col4.metric("Кросс-ссылок", f"{stats.get('cross', 0):,}")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Средняя цена", f"{stats.get('avg_price', 0):,.2f} ₽")
-        col2.metric("Мин. цена", f"{stats.get('min_price', 0):,.2f} ₽")
-        col3.metric("Макс. цена", f"{stats.get('max_price', 0):,.2f} ₽")
-        col4.metric("Охват связей", f"{stats.get('link_percentage', 0)}%")
+        with col2:
+            st.subheader("Дополнительные связи")
+            
+            use_dimensions = st.checkbox(
+                "Связывать по габаритам",
+                value=self.link_rules.get('use_dimensions_linking', True)
+            )
+            self.link_rules['use_dimensions_linking'] = use_dimensions
+            
+            use_barcode = st.checkbox(
+                "Связывать по штрих-кодам",
+                value=self.link_rules.get('use_barcode_linking', True)
+            )
+            self.link_rules['use_barcode_linking'] = use_barcode
+            
+            use_price = st.checkbox(
+                "Связывать цены",
+                value=self.link_rules.get('use_price_linking', True)
+            )
+            self.link_rules['use_price_linking'] = use_price
         
         st.markdown("---")
         
-        # Графики и таблицы
-        tab1, tab2, tab3 = st.tabs(["📊 Распределение", "🏆 Топ брендов", "⚡ Производительность"])
+        # Приоритетные бренды
+        st.subheader("🏆 Приоритетные бренды для связывания")
         
-        with tab1:
-            if 'category_stats' in stats and not stats['category_stats'].empty:
-                st.subheader("Распределение по категориям")
-                st.dataframe(
-                    stats['category_stats'],
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "category": "Категория",
-                        "cnt": "Количество"
-                    }
-                )
-                
-                # Простой бар-чарт
-                st.bar_chart(
-                    stats['category_stats'].set_index('category')['cnt']
-                )
-            else:
-                st.info("Нет данных о категориях")
+        try:
+            brands = self.conn.execute(
+                "SELECT DISTINCT brand FROM parts WHERE brand IS NOT NULL ORDER BY brand"
+            ).fetchall()
+            available_brands = [row[0] for row in brands]
+        except Exception:
+            available_brands = []
         
-        with tab2:
-            if 'top_brands' in stats and not stats['top_brands'].empty:
-                st.subheader("Топ 10 брендов")
-                st.dataframe(
-                    stats['top_brands'],
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "brand": "Бренд",
-                        "cnt": "Количество товаров"
-                    }
-                )
-            else:
-                st.info("Нет данных о брендах")
-        
-        with tab3:
-            st.subheader("Метрики производительности")
+        if available_brands:
+            priority_brands = self.link_rules.get('priority_brands_for_linking', [])
+            exclude_brands = self.link_rules.get('exclude_brands_from_linking', [])
             
-            perf = stats.get('performance', {})
-            
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Всего запросов", perf.get('queries', 0))
-            col2.metric("Попаданий в кэш", perf.get('cache_hits', 0))
-            col3.metric("Эффективность кэша", f"{stats.get('cache_hit_rate', 0):.1f}%")
-            
-            if 'db_size_mb' in stats:
-                st.info(f"💾 Размер базы данных: {stats['db_size_mb']:.1f} МБ")
-            
-            # Health check
-            if st.button("🔍 Проверить целостность БД"):
-                with st.spinner("Проверка базы данных..."):
-                    health = self.check_database_health()
-                    
-                    if health.get('corruption_detected'):
-                        st.error("⚠️ Обнаружены проблемы с целостностью данных!")
-                    else:
-                        st.success("✅ База данных в порядке")
-                    
-                    st.json(health)
-    
-    def show_data_management(self):
-        st.header("🔧 Управление данными")
-        
-        management_option = st.radio(
-            "Выберите действие:",
-            [
-                "🗑️ Удаление данных",
-                "💰 Цены и наценки",
-                "🚫 Исключения",
-                "🗂️ Категории",
-                "🔗 Управление связями",
-                "📋 Маппинг колонок",
-                "🔍 Диагностика"
-            ],
-            horizontal=False
-        )
-        
-        if management_option == "🗑️ Удаление данных":
-            self._show_delete_interface()
-        elif management_option == "💰 Цены и наценки":
-            self.show_price_settings()
-        elif management_option == "🚫 Исключения":
-            self.show_exclusion_settings()
-        elif management_option == "🗂️ Категории":
-            self.show_category_mapping()
-        elif management_option == "🔗 Управление связями":
-            self.show_link_rules_interface()
-        elif management_option == "📋 Маппинг колонок":
-            self.show_column_mapping_interface()
-        elif management_option == "🔍 Диагностика":
-            self._show_diagnostics()
-    
-    def _show_delete_interface(self):
-        st.subheader("🗑️ Удаление данных")
-        st.warning("⚠️ Внимание! Операции удаления необратимы!")
-        
-        delete_option = st.radio(
-            "Тип удаления:",
-            ["По бренду", "По артикулу", "Очистить все данные"],
-            horizontal=True
-        )
-        
-        if delete_option == "По бренду":
-            try:
-                brands = self.conn.execute(
-                    "SELECT DISTINCT brand FROM parts WHERE brand IS NOT NULL ORDER BY brand"
-                ).fetchall()
-                available_brands = [row[0] for row in brands]
-                
-                if available_brands:
-                    selected_brand = st.selectbox("Выберите бренд для удаления:", available_brands)
-                    
-                    count = self.conn.execute(
-                        "SELECT COUNT(*) FROM parts WHERE brand = ?", [selected_brand]
-                    ).fetchone()[0]
-                    
-                    st.info(f"Будет удалено {count:,} записей бренда '{selected_brand}'")
-                    
-                    col1, col2 = st.columns([1, 3])
-                    
-                    with col1:
-                        confirmed = st.checkbox("Подтверждаю")
-                    
-                    with col2:
-                        if st.button("🗑️ Удалить", type="primary", disabled=not confirmed):
-                            if confirmed:
-                                brand_norm = self.normalize_key(pl.Series([selected_brand]))[0]
-                                deleted = self.delete_by_brand(brand_norm)
-                                st.success(f"✅ Удалено {deleted:,} записей")
-                                st.rerun()
-                else:
-                    st.info("Нет данных для удаления")
-                    
-            except Exception as e:
-                st.error(f"Ошибка: {e}")
-        
-        elif delete_option == "По артикулу":
-            artikul_input = st.text_input("Введите артикул для удаления:")
-            
-            if artikul_input:
-                artikul_norm = self.normalize_key(pl.Series([artikul_input]))[0]
-                
-                count = self.conn.execute(
-                    "SELECT COUNT(*) FROM parts WHERE artikul_norm = ?", [artikul_norm]
-                ).fetchone()[0]
-                
-                if count > 0:
-                    st.info(f"Найдено {count:,} записей для артикула '{artikul_input}'")
-                    
-                    # Показать какие записи будут удалены
-                    preview = self.conn.execute("""
-                        SELECT p.artikul, p.brand, COUNT(cr.oe_number_norm) as oe_count
-                        FROM parts p
-                        LEFT JOIN cross_references cr ON p.artikul_norm = cr.artikul_norm 
-                            AND p.brand_norm = cr.brand_norm
-                        WHERE p.artikul_norm = ?
-                        GROUP BY p.artikul, p.brand
-                    """, [artikul_norm]).pl()
-                    
-                    if not preview.is_empty():
-                        st.dataframe(preview.to_pandas(), use_container_width=True, hide_index=True)
-                    
-                    confirmed = st.checkbox("Подтверждаю удаление")
-                    
-                    if st.button("🗑️ Удалить", type="primary", disabled=not confirmed):
-                        if confirmed:
-                            deleted = self.delete_by_artikul(artikul_norm)
-                            st.success(f"✅ Удалено {deleted:,} записей")
-                            st.rerun()
-                else:
-                    st.warning(f"Артикул '{artikul_input}' не найден")
-        
-        elif delete_option == "Очистить все данные":
-            st.error("🚨 Эта операция удалит ВСЕ данные из базы!")
-            
-            parts_count = self.conn.execute("SELECT COUNT(*) FROM parts").fetchone()[0]
-            oe_count = self.conn.execute("SELECT COUNT(*) FROM oe").fetchone()[0]
-            cross_count = self.conn.execute("SELECT COUNT(*) FROM cross_references").fetchone()[0]
-            prices_count = self.conn.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
-            
-            st.info(f"""
-            Будут удалены все записи из таблиц:
-            - Parts: {parts_count:,} записей
-            - OE: {oe_count:,} записей
-            - Cross References: {cross_count:,} записей
-            - Prices: {prices_count:,} записей
-            """)
-            
-            col1, col2, col3 = st.columns(3)
+            col1, col2 = st.columns(2)
             
             with col1:
-                confirm1 = st.checkbox("Я понимаю последствия")
+                st.markdown("**Приоритетные бренды:**")
+                new_priority = st.multiselect(
+                    "Выберите приоритетные бренды:",
+                    available_brands,
+                    default=priority_brands
+                )
+                self.link_rules['priority_brands_for_linking'] = new_priority
             
             with col2:
-                confirm2 = st.checkbox("Данные нельзя восстановить")
+                st.markdown("**Исключенные бренды:**")
+                new_exclude = st.multiselect(
+                    "Выберите исключаемые бренды:",
+                    available_brands,
+                    default=exclude_brands
+                )
+                self.link_rules['exclude_brands_from_linking'] = new_exclude
+        
+        if st.button("💾 Сохранить правила связывания", type="primary"):
+            self.save_link_rules()
+            st.success("✅ Правила связывания сохранены")
+    
+    def _show_column_mapping_interface(self):
+        """Настройки маппинга колонок"""
+        st.header("📋 Управление маппингом колонок")
+        st.info("Настройте соответствие названий колонок в загружаемых файлах")
+        
+        file_types = list(self.column_mapping_config.keys())
+        selected_type = st.selectbox(
+            "Тип файла:",
+            file_types,
+            format_func=lambda x: {
+                'oe': 'OE данные',
+                'cross': 'Кросс-ссылки',
+                'prices': 'Цены',
+                'dimensions': 'Габариты',
+                'barcode': 'Штрих-коды',
+                'images': 'Изображения'
+            }.get(x, x)
+        )
+        
+        if selected_type in self.column_mapping_config:
+            st.subheader(f"Поля для типа: {selected_type}")
             
-            with col3:
-                if st.button("💀 Удалить все данные", type="primary", 
-                            disabled=not (confirm1 and confirm2),
-                            use_container_width=True):
-                    if confirm1 and confirm2:
-                        try:
-                            # Создание бэкапа перед удалением
-                            backup_path = self.data_dir / f"backup_before_clean_{datetime.now().strftime('%Y%m%d_%H%M%S')}.duckdb"
-                            shutil.copy2(self.db_path, backup_path)
-                            
-                            # Очистка таблиц
-                            self.conn.execute("DELETE FROM prices")
-                            self.conn.execute("DELETE FROM cross_references")
-                            self.conn.execute("DELETE FROM oe")
-                            self.conn.execute("DELETE FROM parts")
-                            
-                            self.vacuum_database()
-                            
-                            st.success(f"✅ Все данные удалены. Бэкап сохранен: {backup_path.name}")
-                            st.rerun()
-                            
-                        except Exception as e:
-                            st.error(f"Ошибка при удалении: {e}")
+            config = self.column_mapping_config[selected_type]
+            
+            mapping_data = []
+            for field, variants in config.items():
+                mapping_data.append({
+                    "Поле": field,
+                    "Варианты названий": ", ".join(variants[:5]) + ("..." if len(variants) > 5 else "")
+                })
+            
+            st.dataframe(
+                pd.DataFrame(mapping_data),
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            st.markdown("---")
+            
+            st.subheader("Редактировать поле")
+            
+            field_to_edit = st.selectbox(
+                "Выберите поле:",
+                list(config.keys())
+            )
+            
+            if field_to_edit:
+                current_variants = config[field_to_edit]
+                
+                new_variants_text = st.text_area(
+                    "Варианты названий (по одному на строку):",
+                    value="\n".join(current_variants),
+                    height=200
+                )
+                
+                if st.button("💾 Сохранить варианты"):
+                    new_variants = [v.strip() for v in new_variants_text.split("\n") if v.strip()]
+                    config[field_to_edit] = new_variants
+                    self.save_column_mapping_config()
+                    st.success(f"✅ Варианты для '{field_to_edit}' сохранены")
+                    st.rerun()
+            
+            st.markdown("---")
+            
+            with st.expander("➕ Добавить новое поле"):
+                new_field_name = st.text_input("Название поля:")
+                new_field_variants = st.text_area(
+                    "Варианты названий:",
+                    height=100,
+                    placeholder="Вариант 1\nВариант 2\n..."
+                )
+                
+                if st.button("Добавить поле"):
+                    if new_field_name and new_field_variants:
+                        variants = [v.strip() for v in new_field_variants.split("\n") if v.strip()]
+                        config[new_field_name] = variants
+                        self.save_column_mapping_config()
+                        st.success(f"✅ Поле '{new_field_name}' добавлено")
+                        st.rerun()
+                    else:
+                        st.warning("Заполните все поля")
     
     def _show_diagnostics(self):
+        """Диагностика системы"""
         st.subheader("🔍 Диагностика системы")
         
         if st.button("🔄 Запустить диагностику"):
             with st.spinner("Выполнение диагностики..."):
-                # Health check
                 health = self.check_database_health()
                 
                 col1, col2 = st.columns(2)
@@ -3380,7 +3983,6 @@ class HighVolumeAutoPartsCatalog:
                         "Polars": pl.__version__
                     })
                 
-                # Статистика таблиц
                 st.markdown("### Статистика таблиц")
                 
                 table_stats = []
@@ -3397,7 +3999,6 @@ class HighVolumeAutoPartsCatalog:
                     hide_index=True
                 )
                 
-                # Действия по исправлению
                 orphan_details = health.get('orphan_details', {})
                 if orphan_details.get('cross_orphans', 0) > 0 or orphan_details.get('oe_orphans', 0) > 0:
                     st.warning("Обнаружены сиротские записи!")
@@ -3421,7 +4022,6 @@ class HighVolumeAutoPartsCatalog:
                         except Exception as e:
                             st.error(f"Ошибка: {e}")
 
-
 # ============================================================================
 # ПОЛНОЕ ПРИЛОЖЕНИЕ STREAMLIT
 # ============================================================================
@@ -3429,7 +4029,6 @@ class HighVolumeAutoPartsCatalog:
 def get_high_volume_catalog():
     """Создание каталога через st.cache_resource для корректной работы с DuckDB"""
     return HighVolumeAutoPartsCatalog()
-
 
 def main():
     st.set_page_config(
@@ -3490,7 +4089,7 @@ def main():
                 results = catalog.search_parts(quick_search, limit=10)
                 if not results.empty:
                     st.success(f"Найдено: {len(results)}")
-                    display_cols = [c for c in ['artikul', 'brand', 'multiplicity'] if c in results.columns]
+                    display_cols = [c for c in ['artikul', 'brand', 'multiplicity', 'barcode'] if c in results.columns]
                     if display_cols:
                         st.dataframe(
                             results[display_cols],
@@ -3553,16 +4152,14 @@ def main():
                     "OE данные (оригинальные номера)",
                     type=['xlsx', 'xls', 'csv'],
                     accept_multiple_files=True,
-                    key="oe_uploader",
-                    help="Файлы с оригинальными номерами запчастей"
+                    key="oe_uploader"
                 )
                 
                 cross_files = st.file_uploader(
                     "Кроссы (связи OE-артикул)",
                     type=['xlsx', 'xls', 'csv'],
                     accept_multiple_files=True,
-                    key="cross_uploader",
-                    help="Файлы со связями OE номеров и артикулов"
+                    key="cross_uploader"
                 )
             
             with col2:
@@ -3570,8 +4167,7 @@ def main():
                     "Цены",
                     type=['xlsx', 'xls', 'csv'],
                     accept_multiple_files=True,
-                    key="prices_uploader",
-                    help="Файлы с ценами товаров"
+                    key="prices_uploader"
                 )
         
         with st.expander("📎 Дополнительные данные", expanded=False):
@@ -3582,16 +4178,14 @@ def main():
                     "Габариты (Д×Ш×В×Вес)",
                     type=['xlsx', 'xls', 'csv'],
                     accept_multiple_files=True,
-                    key="dimensions_uploader",
-                    help="Файлы с размерами и весом товаров"
+                    key="dimensions_uploader"
                 )
                 
                 barcode_files = st.file_uploader(
                     "Штрих-коды и кратность",
                     type=['xlsx', 'xls', 'csv'],
                     accept_multiple_files=True,
-                    key="barcode_uploader",
-                    help="Файлы со штрих-кодами и кратностью упаковки"
+                    key="barcode_uploader"
                 )
             
             with col2:
@@ -3599,8 +4193,7 @@ def main():
                     "Изображения (URL)",
                     type=['xlsx', 'xls', 'csv'],
                     accept_multiple_files=True,
-                    key="images_uploader",
-                    help="Файлы со ссылками на изображения товаров"
+                    key="images_uploader"
                 )
         
         with st.expander("📦 Универсальная загрузка", expanded=False):
@@ -3608,8 +4201,7 @@ def main():
                 "Универсальный файл (все данные в одном)",
                 type=['xlsx', 'xls', 'csv'],
                 accept_multiple_files=True,
-                key="universal_uploader",
-                help="Файл, содержащий все типы данных в разных колонках"
+                key="universal_uploader"
             )
         
         st.markdown("---")
@@ -3629,7 +4221,6 @@ def main():
                     'universal': universal_files
                 }
                 
-                # Фильтрация пустых загрузок
                 uploaded_files_dict = {k: v for k, v in uploaded_files_dict.items() if v}
                 
                 if not uploaded_files_dict:
@@ -3640,23 +4231,19 @@ def main():
                     
                     with st.spinner("🔄 Обработка файлов... Это может занять несколько минут"):
                         try:
-                            # Обработка загруженных файлов
                             dataframes = catalog.process_uploaded_files(uploaded_files_dict)
                             
                             if not dataframes:
                                 st.error("❌ Не удалось обработать ни одного файла. Проверьте логи.")
                             else:
-                                # Загрузка в базу данных
                                 catalog.process_and_load_data(dataframes)
                                 
-                                # Сохранение статистики загрузки
                                 st.session_state.uploaded_files = {
                                     k: len(v) for k, v in dataframes.items()
                                 }
                                 
                                 st.success("✅ Все данные успешно загружены в базу!")
                                 
-                                # Отображение результатов
                                 st.subheader("📊 Результаты загрузки")
                                 cols = st.columns(len(dataframes))
                                 for idx, (file_type, count) in enumerate(st.session_state.uploaded_files.items()):
@@ -3710,11 +4297,9 @@ def main():
                 else:
                     st.success(f"✅ Найдено {len(results_df)} записей")
                     
-                    # Проверяем, есть ли колонка search_type (для отображения способа поиска)
                     if 'search_type' in results_df.columns:
                         st.caption(f"🔍 Способ поиска: {results_df['search_type'].iloc[0] if not results_df.empty else 'прямой'}")
                     
-                    # Настройка отображения колонок
                     available_cols = [c for c in results_df.columns 
                                     if c not in ['artikul_norm', 'brand_norm', 'search_type']]
                     
@@ -3729,6 +4314,7 @@ def main():
                             "description": st.column_config.TextColumn("Описание", width="large"),
                             "multiplicity": st.column_config.NumberColumn("Кратность"),
                             "oe_numbers": st.column_config.TextColumn("OE номера", width="large"),
+                            "barcode": st.column_config.TextColumn("Штрихкод", width="medium"),
                         }
                     )
     
@@ -3737,7 +4323,6 @@ def main():
     
     elif menu == "📤 Экспорт":
         catalog.show_export_interface()
-
 
 if __name__ == "__main__":
     main()
